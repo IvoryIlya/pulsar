@@ -12,6 +12,25 @@
 D=${PULSAR_DIR:-/data/pulsar}
 Q=${PULSAR_Q:-/system/vendor/quasar/q}
 
+# The stock voice stack. On the Yandex Stations it is quasar ($Q); a port whose firmware has its
+# own stack (Irbis A) puts an executable stop_oem.sh / start_oem.sh into $D (without them
+# `disable` leaves the audio devices to whatever the firmware starts at boot).
+stop_stock() {
+  if [ -x "$D/stop_oem.sh" ]; then
+    "$D/stop_oem.sh" >/dev/null 2>&1
+  elif [ -x "$Q" ]; then
+    $Q stop >/dev/null 2>&1
+  fi
+}
+
+start_stock() {
+  if [ -x "$D/start_oem.sh" ]; then
+    "$D/start_oem.sh" >/dev/null 2>&1
+  elif ! pidof quasar_launcher2 >/dev/null 2>&1 && [ -x "$Q" ]; then
+    $Q start >/dev/null 2>&1
+  fi
+}
+
 # SIGTERM, wait up to 10 s for the process to go, then SIGKILL. Returns 1 if it is still there.
 stop_daemon() {
   pidof pulsar >/dev/null 2>&1 || return 0
@@ -81,7 +100,7 @@ case "$1" in
       exit 1
     fi
     touch "$D/enabled"
-    $Q stop >/dev/null 2>&1
+    stop_stock
     start_supervisor
     echo "enabled"
     ;;
@@ -93,7 +112,7 @@ case "$1" in
       exit 1
     fi
     wait_supervisors_gone
-    pidof quasar_launcher2 >/dev/null 2>&1 || $Q start >/dev/null 2>&1
+    start_stock
     echo "disabled, Yandex stack started"
     ;;
   restart)

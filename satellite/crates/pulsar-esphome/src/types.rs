@@ -34,6 +34,45 @@ pub struct WakeWordInfo {
     pub languages: Vec<String>,
 }
 
+/// One supported media format of the media player entity (MediaPlayerSupportedFormat): HA
+/// transcodes TTS answers and announcements to the announcement-purpose one. The Yandex
+/// firmwares' GStreamer plays FLAC; devices whose playback is the built-in WAV player declare
+/// 16 kHz mono WAV instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaFormat {
+    /// "flac", "wav".
+    pub format: String,
+    pub rate: u32,
+    pub channels: u32,
+    /// Sample size in bytes.
+    pub sample_bytes: u32,
+    /// true: the ANNOUNCEMENT purpose (TTS / announcements), false: DEFAULT (media player).
+    pub announcement: bool,
+}
+
+/// Which of the station's hardware entities exist beyond the clock/light flags of the config.
+/// All false: no such hardware (e.g. the Irbis A port so far), and the entity is left out of
+/// the list and its states are not sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UiFeatures {
+    pub leds: bool,
+    pub keys: bool,
+    pub hw_mute: bool,
+    /// The wake word runs on the device (a station arbiter makes sense).
+    pub device_wake_word: bool,
+}
+
+impl Default for UiFeatures {
+    fn default() -> Self {
+        UiFeatures {
+            leds: true,
+            keys: true,
+            hw_mute: true,
+            device_wake_word: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApiConfig {
     /// 6053.
@@ -60,6 +99,10 @@ pub struct ApiConfig {
     pub has_clock: bool,
     /// false: no Illuminance sensor, no lux states.
     pub has_lux: bool,
+    /// Supported media formats of the media player entity; empty: the FLAC/48 kHz default.
+    pub media_formats: Vec<MediaFormat>,
+    /// The remaining hardware entities to list.
+    pub ui: UiFeatures,
     /// File holding the Noise encryption key (base64 of 32 bytes, as ESPHome's `api: encryption:
     /// key`). Missing or empty file: plaintext (and provisioning with the all-zeros key). HA may
     /// set or rotate it with NoiseEncryptionSetKeyRequest. None: encryption unsupported.
@@ -80,6 +123,8 @@ impl Default for ApiConfig {
             zigbee_modes: Vec::new(),
             has_clock: true,
             has_lux: true,
+            media_formats: Vec::new(),
+            ui: UiFeatures::default(),
             key_path: None,
         }
     }

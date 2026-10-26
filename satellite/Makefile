@@ -1,7 +1,7 @@
 # Cross-build for Yandex Stations with cargo-zigbuild: one binary per userland ABI.
 #   ARCH=aarch64  64-bit userspace (Station Midi, glibc 2.36)
 #   ARCH=armhf    32-bit userspace (Station Lite 2 and Mini 2, glibc 2.30; also Midi images with
-#                  an armhf userland)
+#                  an armhf userland; ARMHF_GLIBC lowers the floor for older-libc ports)
 # `make` builds both daemons; `make ARCH=armhf` one of them. Output: build/<arch>/pulsar (stripped,
 # the one deployed) and build/<arch>/pulsar.debug (line tables, for `addr2line -f -e` on the crash
 # report; non-PIE, so the addresses in it are absolute). `make ARCH=armhf tools` builds every tool
@@ -69,13 +69,17 @@ RUST_CPU    :=
 RUST_TARGET := aarch64-unknown-linux-gnu
 GLIBC       := 2.36
 else ifeq ($(ARCH),armhf)
-TARGET      := arm-linux-gnueabihf.2.30
+# ARMHF_GLIBC: the glibc floor of the armhf build, 2.30 for the Stations. A port whose firmware
+# has an older libc (bring-up: the installer probe prints it) rebuilds with e.g.
+# `make ARCH=armhf ARMHF_GLIBC=2.25`.
+ARMHF_GLIBC ?= 2.30
+TARGET      := arm-linux-gnueabihf.$(ARMHF_GLIBC)
 CPU         := -mcpu=cortex_a53
 # Same core as the C++ build: VFPv4 makes f32/f64 mul_add a vfma instruction (the generic armv7
 # target calls libm fmaf instead).
 RUST_CPU    := -C target-cpu=cortex-a53
 RUST_TARGET := armv7-unknown-linux-gnueabihf
-GLIBC       := 2.30
+GLIBC       := $(ARMHF_GLIBC)
 else
 $(error ARCH must be one of: $(ARCHES))
 endif
@@ -122,7 +126,7 @@ TOOLS     := $(basename $(notdir $(wildcard crates/*/src/bin/*.rs)))
 # cargo always runs (FORCE) and decides itself what is out of date; `+` hands it make's jobserver.
 # Builds of both arches share target/ and wait for each other on its lock. The deployed binary is
 # stripped (/data holds the binary, its .prev and the upload: ~80 MB on the Lite 2, ~20 MB on the
-# Mini 2).
+# Mini 2, ~29 MB on the Irbis A's /bkupgrade — which also carries the glibc sidecar).
 binary: $(SS_STAMP) FORCE
 	+$(ZIGBUILD) -p pulsar --bin pulsar
 	@mkdir -p $(BUILD)

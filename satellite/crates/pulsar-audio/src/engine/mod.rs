@@ -223,8 +223,126 @@ impl Slot {
     }
 }
 
-/// The daemon's VQE + wake word spotter + optional command spotter.
-pub(crate) struct Engine {
+/// The daemon's audio engine: the Yandex VQE + wake word spotter + optional command spotter on
+/// devices whose firmware carries libyandex_evil, or a pass-through of the capture plug on
+/// devices without it (`Model::vqe_preset` empty, e.g. the Irbis A): no echo cancellation and
+/// no spotter run locally, the wake word is detected in Home Assistant on the streamed audio.
+pub(crate) enum Engine {
+    // Boxed: the VQE/spotter state is much larger than the direct engine's (clippy
+    // large_enum_variant).
+    Yandex(Box<YandexEngine>),
+    Direct(DirectEngine),
+}
+
+/// Capture frames per chunk and output samples per chunk of the direct engine: one 32 ms frame
+/// at 16 kHz, the size the pipeline (and HA's VoiceAssistantAudio) expects.
+pub(crate) const DIRECT_CHUNK: usize = 512;
+
+impl Engine {
+    /// dlopen, VQE for the model's preset, the wake word spotter (required) and the command spotter
+    /// (optional: a warning without it). Errors are logged; None = no front-end. Models without a
+    /// VQE preset get the direct engine and nothing is loaded.
+    pub fn start(
+        model: &pulsar_core::model::Model,
+        wake_dir: &Path,
+        command_dir: Option<&Path>,
+    ) -> Option<Engine> {
+        if !model.has_engine() {
+            info!(
+                "no Yandex voice engine on this model: streaming {} directly (wake word in Home Assistant)",
+                model.capture_pcm
+            );
+            return Some(Engine::Direct(DirectEngine::new()));
+        }
+        YandexEngine::start(model, wake_dir, command_dir).map(|e| Engine::Yandex(Box::new(e)))
+    }
+
+    /// Capture frames per processing chunk.
+    pub fn chunk(&self) -> usize {
+        match self {
+            Engine::Yandex(e) => e.chunk,
+            Engine::Direct(_) => DIRECT_CHUNK,
+        }
+    }
+
+    /// Switches the wake word model; false when there is none (direct engine) or it failed.
+    pub fn set_wake_model(&mut self, dir: &Path) -> bool {
+        match self {
+            Engine::Yandex(e) => e.set_wake_model(dir),
+            Engine::Direct(_) => {
+                warn!("cannot switch the wake word model: this device has no spotter");
+                false
+            }
+        }
+    }
+
+    /// One chunk; false after an error (logged).
+    pub fn process(&mut self, mics: &[f32], spk: &[f32]) -> bool {
+        match self {
+            Engine::Yandex(e) => e.process(mics, spk),
+            Engine::Direct(e) => e.process(mics),
+        }
+    }
+
+    /// Output channel `ty` of the last chunk; None after an error (logged) or when the engine
+    /// does not produce it.
+    pub fn output(&self, ty: i32) -> Option<&[f32]> {
+        match self {
+            Engine::Yandex(e) => e.output(ty),
+            Engine::Direct(e) => e.output(ty),
+        }
+    }
+
+    /// Feeds the last chunk to the wake word spotter; its confirmed phrases.
+    pub fn feed_wake(&mut self) -> Vec<String> {
+        match self {
+            Engine::Yandex(e) => e.feed_wake(),
+            Engine::Direct(_) => Vec::new(),
+        }
+    }
+
+    /// Feeds the last chunk to the command spotter; its confirmed phrases.
+    pub fn feed_command(&mut self) -> Vec<String> {
+        match self {
+            Engine::Yandex(e) => e.feed_command(),
+            Engine::Direct(_) => Vec::new(),
+        }
+    }
+}
+
+/// Pass-through engine: one mono channel of the capture plug, unchanged. The samples already
+/// come from the device's own DSP chain; there is no echo cancellation here, so playback is
+/// audible in the stream (see docs/irbis-a.md).
+pub(crate) struct DirectEngine {
+    out: Vec<f32>,
+}
+
+impl DirectEngine {
+    fn new() -> DirectEngine {
+        DirectEngine {
+            out: vec![0.0; DIRECT_CHUNK],
+        }
+    }
+
+    /// Copies the chunk's first microphone channel; always ok.
+    fn process(&mut self, mics: &[f32]) -> bool {
+        self.out.resize(DIRECT_CHUNK, 0.0);
+        let n = self.out.len().min(mics.len());
+        self.out[..n].copy_from_slice(&mics[..n]);
+        for v in &mut self.out[n..] {
+            *v = 0.0;
+        }
+        true
+    }
+
+    /// The same mono buffer for every output type the pipeline asks for.
+    fn output(&self, ty: i32) -> Option<&[f32]> {
+        matches!(ty, VQE_OMNI | VQE_OMNI_WITH_GAIN | RAW_MAIN_MIC_SYNC).then_some(&self.out[..])
+    }
+}
+
+/// VQE + wake word spotter + optional command spotter of the Yandex firmware libraries.
+pub(crate) struct YandexEngine {
     // Fields drop in declaration order: the spotters first, then the VQE (instance, then its
     // config), as the C++ engine's destructor freed them.
     wake: Slot,
@@ -237,14 +355,12 @@ pub(crate) struct Engine {
     frame: usize,
 }
 
-impl Engine {
-    /// dlopen, VQE for the model's preset, the wake word spotter (required) and the command spotter
-    /// (optional: a warning without it). Errors are logged; None = no front-end.
-    pub fn start(
+impl YandexEngine {
+    fn start(
         model: &pulsar_core::model::Model,
         wake_dir: &Path,
         command_dir: Option<&Path>,
-    ) -> Option<Engine> {
+    ) -> Option<YandexEngine> {
         if let Err(e) = preload_deps() {
             warn!("libtflite: {e}");
         }
@@ -281,7 +397,7 @@ impl Engine {
             return None;
         };
         info!("VQE '{preset}': {chunk} input frames -> {frame} output samples per chunk");
-        let mut eng = Engine {
+        let mut eng = YandexEngine {
             wake: Slot::new("wake word"),
             cmd: Slot::new("command"),
             vqe,
@@ -301,12 +417,12 @@ impl Engine {
     }
 
     /// Switches the wake word model.
-    pub fn set_wake_model(&mut self, dir: &Path) -> bool {
+    fn set_wake_model(&mut self, dir: &Path) -> bool {
         self.wake.init(&self.lib, dir, VQE_OMNI_WITH_GAIN)
     }
 
     /// One VQE chunk; false after an error (logged).
-    pub fn process(&mut self, mics: &[f32], spk: &[f32]) -> bool {
+    fn process(&mut self, mics: &[f32], spk: &[f32]) -> bool {
         self.vqe
             .process(mics, spk)
             .inspect_err(|e| error!("VQE process: {e}"))
@@ -314,7 +430,7 @@ impl Engine {
     }
 
     /// VQE output channel `ty` of the last chunk; None after an error (logged).
-    pub fn output(&self, ty: i32) -> Option<&[f32]> {
+    fn output(&self, ty: i32) -> Option<&[f32]> {
         self.vqe
             .output(ty)
             .inspect_err(|e| error!("VQE output: {e}"))
@@ -322,12 +438,12 @@ impl Engine {
     }
 
     /// Feeds the last chunk to the wake word spotter; its confirmed phrases.
-    pub fn feed_wake(&mut self) -> Vec<String> {
+    fn feed_wake(&mut self) -> Vec<String> {
         feed(&self.vqe, self.frame, &mut self.wake)
     }
 
     /// Feeds the last chunk to the command spotter; its confirmed phrases.
-    pub fn feed_command(&mut self) -> Vec<String> {
+    fn feed_command(&mut self) -> Vec<String> {
         feed(&self.vqe, self.frame, &mut self.cmd)
     }
 }

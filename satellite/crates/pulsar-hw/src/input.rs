@@ -2,7 +2,11 @@
 //! Station Midi: touch keys "awinic_sar", mute switch "mute"; Station Lite 2: touch keys
 //! "aw9610x", mute switch "gpio-keys"; Station Mini 2: touch keys "sar0_pad0", no mute switch
 //! device: the latched mute line is a GPIO (`Model::mute_gpio`, low = muted), sampled every
-//! 100 ms. All use the same key codes and switch:
+//! 100 ms. Ports without any of that (Irbis A): `keys_input` is a comma-separated list and
+//! every device in it is opened (`adc_keypad` carries KEY_VOLUMEUP/DOWN plus a momentary
+//! KEY_MUTE, `gpio_keypad` the action key as KEY_WWW (123)); with `Model::keys_mute` a
+//! KEY_MUTE press toggles the microphone mute (unmuted after a boot). All use the same key
+//! codes and switch:
 //!
 //! touch keys (capacitive, EV_KEY only; Midi KEY bitmap "40 0 0 0 0 0 0 0 c000000000000 0"):
 //!   KEY_VOICECOMMAND (582) -> Action     (maind: "ACTIVATE")
@@ -44,8 +48,20 @@ const SYN_DROPPED: u16 = 3;
 const SW_MUTE_DEVICE: u16 = 0x0e;
 /// KEY_VOICECOMMAND
 const KEY_ACTION: u16 = 582;
+/// Alternative action keys of ports whose keypads report other codes; treated exactly like
+/// KEY_VOICECOMMAND. KEY_PLAYPAUSE (164): standard media keypads. KEY_WWW (123): the Irbis A's
+/// gpio_keypad (its single advertised key).
+const KEY_ACTION_MEDIA: u16 = 164;
+const KEY_ACTION_WWW: u16 = 123;
+/// Every code that acts as the action key (resync after SYN_DROPPED).
+const KEY_ACTIONS: [u16; 3] = [KEY_ACTION, KEY_ACTION_MEDIA, KEY_ACTION_WWW];
+/// KEY_MUTE: with `Model::keys_mute`, a press toggles the microphone mute (the Irbis A's
+/// adc_keypad; the stock firmware's btn_listener used it to toggle the master volume).
+const KEY_MUTE: u16 = 113;
 const KEY_VOLUMEDOWN: u16 = 114;
 const KEY_VOLUMEUP: u16 = 115;
+/// Key devices opened at most (`Model::keys_input` is a comma-separated list).
+const MAX_KEY_DEVS: usize = 4;
 
 const LONG_PRESS_MS: u64 = 800;
 const REPEAT_DELAY_MS: u64 = 500;
@@ -103,7 +119,10 @@ impl InputHandle {
 pub fn spawn_input(
     model: &'static Model,
 ) -> Result<(InputHandle, UnboundedReceiver<InputEvent>), String> {
-    let keys = open_dev(model.keys_input, false);
+    let mut keys: [Option<AsyncFd<Evdev>>; MAX_KEY_DEVS] = std::array::from_fn(|_| None);
+    for (i, name) in key_names(model).enumerate().take(MAX_KEY_DEVS) {
+        keys[i] = open_dev(name, false);
+    }
     let mute = if model.mute_input.is_empty() {
         None
     } else {
@@ -114,12 +133,13 @@ pub fn spawn_input(
     } else {
         open_mute_gpio(GPIO_DIR, model.mute_gpio, false)
     };
-    if keys.is_none() && mute.is_none() && mute_gpio.is_none() {
+    if keys.iter().all(Option::is_none) && mute.is_none() && mute_gpio.is_none() {
         return Err("input devices unavailable".to_owned());
     }
     let muted = Rc::new(Cell::new(false));
     let (tx, rx) = unbounded_channel();
     let mut m = Machine::new(Rc::clone(&muted), tx);
+    m.keys_mute = model.keys_mute;
     // The state the controller starts from: no event for it.
     if let Some(fd) = &mute {
         m.read_mute_state(fd.get_ref().switch_state(), false);
@@ -146,6 +166,7 @@ pub fn spawn_input(
         mute,
         mute_gpio,
     };
+
     pulsar_core::actors::spawn_actor("input", run(m, devs, alive_rx));
     Ok((
         InputHandle {
@@ -175,6 +196,9 @@ fn find_event_dev_in(devices: &str, name: &str) -> Option<String> {
 }
 
 fn open_dev(name: &str, quiet: bool) -> Option<AsyncFd<Evdev>> {
+    if name.is_empty() {
+        return None;
+    }
     let devices = pulsar_core::sysfs::read_file("/proc/bus/input/devices").unwrap_or_default();
     let Some(path) = find_event_dev_in(&devices, name) else {
         if !quiet {
@@ -265,7 +289,8 @@ enum Tick {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Dev {
-    Keys,
+    /// Index into the opened `Model::keys_input` devices.
+    Keys(usize),
     Mute,
 }
 
@@ -274,6 +299,8 @@ struct Machine {
     timers: Timers<Tick>,
     epoch: Instant,
     muted: Rc<Cell<bool>>,
+    /// KEY_MUTE on the keys devices toggles the mute (no switch or GPIO line on this model).
+    keys_mute: bool,
     tx: UnboundedSender<InputEvent>,
     /// Press time; None = not pressed.
     action_down: Option<i64>,
@@ -283,7 +310,7 @@ struct Machine {
     repeat_since: i64,
     // After SYN_DROPPED the kernel discards events up to the next SYN_REPORT; the state is then
     // read back from the device.
-    keys_dropped: bool,
+    keys_dropped: [bool; MAX_KEY_DEVS],
     mute_dropped: bool,
     /// Per `Tick`: bumped whenever the timer is armed or cancelled.
     generation: [u64; 5],
@@ -309,7 +336,8 @@ impl Machine {
             action_long_sent: false,
             repeat_code: None,
             repeat_since: 0,
-            keys_dropped: false,
+            keys_mute: false,
+            keys_dropped: [false; MAX_KEY_DEVS],
             mute_dropped: false,
             generation: [0; 5],
         }
@@ -370,7 +398,14 @@ impl Machine {
 
     fn on_key(&mut self, code: u16, value: i32) {
         let now = self.now();
-        if code == KEY_ACTION {
+        if code == KEY_MUTE {
+            if value == 1 && self.keys_mute {
+                let m = !self.muted.get();
+                self.set_muted(m, true);
+            }
+            return;
+        }
+        if KEY_ACTIONS.contains(&code) {
             if value == 1 && self.action_down.is_none() {
                 self.action_down = Some(now);
                 self.action_long_sent = false;
@@ -485,7 +520,7 @@ impl Machine {
                 return;
             }
         };
-        if self.action_down.is_some() && !test_bit(&b, KEY_ACTION) {
+        if self.action_down.is_some() && !KEY_ACTIONS.iter().any(|&c| test_bit(&b, c)) {
             self.on_key(KEY_ACTION, 0);
         }
         if let Some(code) = self.repeat_code
@@ -507,7 +542,7 @@ impl Machine {
     ) {
         for e in events {
             let dropped = match dev {
-                Dev::Keys => self.keys_dropped,
+                Dev::Keys(i) => self.keys_dropped[i],
                 Dev::Mute => self.mute_dropped,
             };
             if e.type_ == EV_SYN {
@@ -517,7 +552,7 @@ impl Machine {
                 } else if e.code == SYN_REPORT && dropped {
                     self.set_dropped(dev, false);
                     match dev {
-                        Dev::Keys => self.resync_keys(key_state()),
+                        Dev::Keys(_) => self.resync_keys(key_state()),
                         Dev::Mute => self.read_mute_state(switch_state(), true),
                     }
                 }
@@ -526,7 +561,7 @@ impl Machine {
             if dropped {
                 continue;
             }
-            if e.type_ == EV_KEY && dev == Dev::Keys {
+            if e.type_ == EV_KEY && matches!(dev, Dev::Keys(_)) {
                 self.on_key(e.code, e.value);
             } else if e.type_ == EV_SW && e.code == SW_MUTE_DEVICE {
                 self.set_muted(e.value != 0, true);
@@ -536,7 +571,7 @@ impl Machine {
 
     fn set_dropped(&mut self, dev: Dev, v: bool) {
         match dev {
-            Dev::Keys => self.keys_dropped = v,
+            Dev::Keys(i) => self.keys_dropped[i] = v,
             Dev::Mute => self.mute_dropped = v,
         }
     }
@@ -544,16 +579,22 @@ impl Machine {
 
 struct Devices {
     model: &'static Model,
-    keys: Option<AsyncFd<Evdev>>,
+    /// One slot per comma-separated name of `Model::keys_input` (slot i is name i).
+    keys: [Option<AsyncFd<Evdev>>; MAX_KEY_DEVS],
     mute: Option<AsyncFd<Evdev>>,
     /// Value file of `Model::mute_gpio`.
     mute_gpio: Option<File>,
 }
 
+/// The comma-separated names of `Model::keys_input`.
+fn key_names(model: &Model) -> impl Iterator<Item = &str> {
+    model.keys_input.split(',').filter(|n| !n.is_empty())
+}
+
 impl Devices {
     fn get(&self, dev: Dev) -> Option<&AsyncFd<Evdev>> {
         match dev {
-            Dev::Keys => self.keys.as_ref(),
+            Dev::Keys(i) => self.keys[i].as_ref(),
             Dev::Mute => self.mute.as_ref(),
         }
     }
@@ -561,9 +602,9 @@ impl Devices {
     /// Drops a device for the reopen timer; keys still held will never be released.
     fn close(&mut self, dev: Dev, m: &mut Machine) {
         match dev {
-            Dev::Keys => {
+            Dev::Keys(i) => {
                 m.release_all();
-                self.keys = None;
+                self.keys[i] = None;
             }
             Dev::Mute => self.mute = None,
         }
@@ -571,9 +612,11 @@ impl Devices {
 
     /// Devices that were missing at start or vanished (ENODEV) are looked up again.
     fn reopen_missing(&mut self, m: &mut Machine) {
-        if self.keys.is_none() {
-            self.keys = open_dev(self.model.keys_input, true);
-            m.keys_dropped = false;
+        for (i, name) in key_names(self.model).enumerate().take(MAX_KEY_DEVS) {
+            if self.keys[i].is_none() {
+                self.keys[i] = open_dev(name, true);
+                m.keys_dropped[i] = false;
+            }
         }
         if self.mute.is_none() && !self.model.mute_input.is_empty() {
             self.mute = open_dev(self.model.mute_input, true);
@@ -620,6 +663,22 @@ async fn readable(fd: Option<&AsyncFd<Evdev>>) -> io::Result<()> {
     }
 }
 
+/// Resolves with the index of the first readable keys device (and the poll error, if that is
+/// what its readiness reported); pending while none is open or readable.
+async fn readable_keys(fds: &[Option<AsyncFd<Evdev>>; MAX_KEY_DEVS]) -> (usize, io::Result<()>) {
+    std::future::poll_fn(|cx| {
+        for (i, fd) in fds.iter().enumerate() {
+            if let Some(fd) = fd
+                && let std::task::Poll::Ready(r) = fd.poll_read_ready(cx)
+            {
+                return std::task::Poll::Ready((i, r.map(drop)));
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
+
 async fn run(mut m: Machine, mut devs: Devices, mut alive: UnboundedReceiver<()>) {
     let mut buf = [sys::EMPTY_EVENT; 16];
     loop {
@@ -629,11 +688,13 @@ async fn run(mut m: Machine, mut devs: Devices, mut alive: UnboundedReceiver<()>
                 Tick::Reopen => devs.reopen_missing(&mut m),
                 Tick::MuteGpio => devs.poll_mute_gpio(&mut m),
                 t => m.on_tick(t, |m| {
-                    drain(m, &mut devs, Dev::Keys, &mut buf, Read::Now);
+                    for i in 0..MAX_KEY_DEVS {
+                        drain(m, &mut devs, Dev::Keys(i), &mut buf, Read::Now);
+                    }
                     drain(m, &mut devs, Dev::Mute, &mut buf, Read::Now);
                 }),
             },
-            r = readable(devs.keys.as_ref()) => ready(&mut m, &mut devs, Dev::Keys, r, &mut buf),
+            (i, r) = readable_keys(&devs.keys) => ready(&mut m, &mut devs, Dev::Keys(i), r, &mut buf),
             r = readable(devs.mute.as_ref()) => ready(&mut m, &mut devs, Dev::Mute, r, &mut buf),
             None = alive.recv() => break,
         }
@@ -677,12 +738,12 @@ fn drain(m: &mut Machine, devs: &mut Devices, dev: Dev, buf: &mut [RawInputEvent
         match r {
             Ok(0) => return,
             Ok(n) => {
-                let (keys, mute) = (devs.keys.as_ref(), devs.mute.as_ref());
+                let mute = devs.mute.as_ref();
                 m.process(
                     dev,
                     fd.as_raw_fd(),
                     &buf[..n],
-                    &mut || keys.map_or_else(|| Err(no_dev()), |k| k.get_ref().key_state()),
+                    &mut || fd.get_ref().key_state(),
                     &mut || mute.map_or_else(|| Err(no_dev()), |k| k.get_ref().switch_state()),
                 );
             }

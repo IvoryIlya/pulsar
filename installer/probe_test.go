@@ -52,3 +52,55 @@ func TestStationCode(t *testing.T) {
 		}
 	}
 }
+
+func TestIrbisModel(t *testing.T) {
+	if got := modelName("irbisA"); got != "Irbis A" {
+		t.Errorf("modelName(irbisA) = %q", got)
+	}
+	if got := abis("irbisA"); len(got) != 1 || got[0] != "armhf" {
+		t.Errorf("abis(irbisA) = %v", got)
+	}
+	if hasZigbee("irbisA") {
+		t.Error("irbisA has no Zigbee radio")
+	}
+	// The port's devicetree says "irbis,<board>"; the real Irbis A reports only the generic
+	// "amlogic, axg" and needs --model / /data/pulsar/model instead.
+	if got, ok := stationCode("irbis,a\namlogic, axg\n"); got != "irbisA" || !ok {
+		t.Errorf("stationCode(irbis) = %q, %v", got, ok)
+	}
+	if got, ok := stationCode("amlogic, axg\n"); got != "" || ok {
+		t.Errorf("stationCode(axg) = %q, %v", got, ok)
+	}
+	if got, ok := stationCode("yandex,station-mini2\namlogic, axg\n"); got != "station-mini2" || !ok {
+		t.Errorf("stationCode(mini2) = %q, %v", got, ok)
+	}
+	if got, _ := stationCode("irbis,\n"); got == "irbisA" {
+		t.Error("a bare irbis, prefix must not match")
+	}
+}
+
+func TestNormalizeSSH(t *testing.T) {
+	for in, want := range map[string]string{
+		"ssh://root@192.168.1.50":      "ssh://root@192.168.1.50:22",
+		"root@192.168.1.50":            "ssh://root@192.168.1.50:22",
+		"root@station:2222":            "ssh://root@station:2222",
+		"ssh://station":                "ssh://root@station:22",
+		"ssh://user@192.168.1.50:2222": "ssh://user@192.168.1.50:2222",
+	} {
+		if got := normalizeSSH(in); got != want {
+			t.Errorf("normalizeSSH(%q) = %q, want %q", in, got, want)
+		}
+	}
+	for _, bad := range []string{"ssh://", "@host", "root@", "ssh://a/b", "root@h:notaport"} {
+		if got := normalizeSSH(bad); got != "" {
+			t.Errorf("normalizeSSH(%q) = %q, want empty", bad, got)
+		}
+	}
+	tg, err := parseSSH("ssh://root@192.168.1.50:2222")
+	if err != nil || tg.user != "root" || tg.host != "192.168.1.50" || tg.port != "2222" {
+		t.Errorf("parseSSH = %+v, %v", tg, err)
+	}
+	if !isSSH("ssh://root@h:22") || isSSH("192.168.1.50:5555") {
+		t.Error("isSSH")
+	}
+}

@@ -9,7 +9,9 @@
 //! pushes the framebuffer at the *start* of each write/pan), so every frame is pwrite() +
 //! FBIOPAN_DISPLAY. Cost ~2.5 ms per ring update (i2c), far cheaper than per-LED sysfs writes.
 //! If the framebuffers are missing or the triggers are not active, the per-channel sysfs
-//! brightness files are kept open instead.
+//! brightness files are kept open instead. A ring on a raw i2c LED controller (`LedStrip::i2c_dev`,
+//! the Irbis A's IS31FL3236 with 8 RGB LEDs behind /dev/i2c-0) is driven directly over i2c-dev —
+//! the kernel exposes nothing for it.
 //!
 //! Ring index order: Yandex patterns (ledpatterns/ring/*.led, one RRGGBB column per LED) anchor
 //! their animations at the first LED and grow symmetrically to its neighbours (mute.led,
@@ -396,7 +398,12 @@ impl LedsHandle {
 pub fn spawn_leds(model: &'static Model) -> LedsHandle {
     let n = usize::try_from(model.ring.count).unwrap_or(0);
     let nlogo = usize::try_from(model.logo.count).unwrap_or(0);
-    let sink = if let Some(fb) = open_fb(model, nlogo) {
+    // The i2c ring first: a model that declares one has no ledfb/sysfs LEDs at all, and
+    // probing for them would only log noise.
+    let sink = if let Some(i2c) = open_i2c(model) {
+        info!("leds: driving {n} ring LEDs via i2c (IS31FL3236)");
+        i2c
+    } else if let Some(fb) = open_fb(model, nlogo) {
         info!("leds: driving {n} ring + {nlogo} logo LEDs via framebuffer");
         fb
     } else if let Some(files) = open_sysfs(model, n, nlogo) {
@@ -483,6 +490,8 @@ enum Sink {
     },
     /// [ring r,g,b x n][logo r,g,b x nlogo]
     Sysfs(Vec<File>),
+    /// Ring on a raw i2c LED controller (no logo support).
+    I2c(Is31fl3236),
     /// Host tests: (time, pixels) of every write that changed something.
     #[cfg(test)]
     Capture(Captured),
@@ -573,6 +582,11 @@ impl Output {
                     }
                 }
             }
+            Sink::I2c(ring) => {
+                if !have_last || px[..split] != self.last[..split] {
+                    ring.write(&px[..split], !have_last, &mut self.warn[0], now);
+                }
+            }
         }
         self.last.copy_from_slice(px);
         self.has_last = true;
@@ -655,6 +669,117 @@ fn open_strip_fb(model: &Model, s: &LedStrip) -> Option<Framebuffer> {
             None
         }
     }
+}
+
+/// IS31FL3236 / SN3236: 8 RGB LEDs (24 constant-current PWM channels) behind raw i2c-dev, as
+/// on the Irbis A. Register map and the init sequence per the datasheet and the port's bring-up
+/// tool (which this mirrors write for write): SHUTDOWN 0x00 (1 = normal operation), FREQ 0x4A,
+/// LED_CTRL 0x26 with the per-channel enables at 0x27.., PWM registers from 0x01 (LED i is
+/// R,G,B at 0x01 + 3i), and UPDATE 0x25 (any value latches the PWM bank).
+struct Is31fl3236 {
+    bus: crate::sys::I2c,
+    leds: usize,
+    /// PWM values last written (per channel); unchanged LEDs are not rewritten.
+    prev: Vec<u8>,
+    has_prev: bool,
+}
+
+const REG_SHUTDOWN: u8 = 0x00;
+const REG_PWM: u8 = 0x01;
+const REG_UPDATE: u8 = 0x25;
+const REG_LED_CTRL: u8 = 0x26;
+const REG_LED_CTRL_FIRST: u8 = 0x27;
+const REG_FREQ: u8 = 0x4a;
+
+impl Is31fl3236 {
+    /// Opens the bus, claims the chip and brings it out of shutdown with every needed channel
+    /// enabled. `leds` is at most 8 (24 channels).
+    fn open(model: &Model) -> Option<Is31fl3236> {
+        let strip = &model.ring;
+        if strip.i2c_dev.is_empty() || !(1..=8).contains(&strip.count) {
+            return None;
+        }
+        let leds = strip.count as usize;
+        let bus = match crate::sys::I2c::open(strip.i2c_dev, strip.i2c_addr) {
+            Ok(b) => b,
+            Err(e) => {
+                error!(
+                    "leds: cannot open {} at {:#04x}: {}",
+                    strip.i2c_dev,
+                    strip.i2c_addr,
+                    crate::errstr(&e)
+                );
+                return None;
+            }
+        };
+        let chip = Is31fl3236 {
+            bus,
+            leds,
+            prev: vec![0; leds * 3],
+            has_prev: false,
+        };
+        let init = || -> std::io::Result<()> {
+            chip.bus.write2(REG_SHUTDOWN, 1)?;
+            chip.bus.write2(REG_FREQ, 0)?;
+            chip.bus.write2(REG_LED_CTRL, 0)?;
+            for r in REG_LED_CTRL_FIRST..REG_LED_CTRL_FIRST + 3 * leds as u8 {
+                chip.bus.write2(r, 1)?;
+            }
+            chip.bus.write2(REG_UPDATE, 0)
+        };
+        if let Err(e) = init() {
+            error!("leds: IS31FL3236 init: {}", crate::errstr(&e));
+            return None;
+        }
+        Some(chip)
+    }
+
+    /// Writes the ring pixels (r,g,b per LED); `force` rewrites every channel. An i2c failure
+    /// is warned about at most once per WARN_EVERY_MS and the cached state is dropped, so the
+    /// next frame rewrites everything.
+    fn write(&mut self, px: &[u8], force: bool, w: &mut WriteWarn, now: i64) {
+        let mut changed = false;
+        for i in 0..self.leds {
+            let rgb = [px[i * 3], px[i * 3 + 1], px[i * 3 + 2]];
+            if !force && self.has_prev && self.prev[i * 3..i * 3 + 3] == rgb {
+                continue;
+            }
+            let base = REG_PWM + (i * 3) as u8;
+            let res = self
+                .bus
+                .write2(base, rgb[0])
+                .and_then(|()| self.bus.write2(base + 1, rgb[1]))
+                .and_then(|()| self.bus.write2(base + 2, rgb[2]));
+            if let Err(e) = res {
+                warn_write(w, "ring i2c", &e, now);
+                self.has_prev = false;
+                return;
+            }
+            self.prev[i * 3..i * 3 + 3].copy_from_slice(&rgb);
+            changed = true;
+        }
+        if (changed || force)
+            && let Err(e) = self.bus.write2(REG_UPDATE, 0)
+        {
+            warn_write(w, "ring i2c update", &e, now);
+            self.has_prev = false;
+            return;
+        }
+        self.has_prev = true;
+    }
+}
+
+/// The i2c sink, when the model's ring sits on an i2c LED controller. A logo cannot be driven
+/// this way (no such model exists).
+fn open_i2c(model: &Model) -> Option<Sink> {
+    if model.ring.i2c_dev.is_empty() {
+        return None;
+    }
+    if model.logo.count > 0 {
+        warn!("leds: an i2c ring cannot drive a logo; LEDs unavailable");
+        return None;
+    }
+    Is31fl3236::open(model).map(Sink::I2c)
 }
 
 fn open_fb(model: &Model, nlogo: usize) -> Option<Sink> {

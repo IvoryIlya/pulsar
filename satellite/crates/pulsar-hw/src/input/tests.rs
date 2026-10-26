@@ -77,13 +77,9 @@ impl Rig {
     async fn tick_with(&mut self, queued: &[RawInputEvent]) {
         let t = self.m.timers.next().await;
         self.m.on_tick(t, |m| {
-            m.process(
-                Dev::Keys,
-                7,
-                queued,
-                &mut || Ok([0; 96]),
-                &mut || Ok([0; 8]),
-            );
+            m.process(Dev::Keys(0), 7, queued, &mut || Ok([0; 96]), &mut || {
+                Ok([0; 8])
+            });
         });
     }
 
@@ -105,13 +101,13 @@ const VOL_UP: InputEvent = InputEvent::Button(Button::VolumeUp, Press::Short);
 #[tokio::test(start_paused = true)]
 async fn action_long_fires_while_held_and_the_release_adds_nothing() {
     let mut r = Rig::new();
-    r.feed(Dev::Keys, &key(KEY_ACTION, 1));
+    r.feed(Dev::Keys(0), &key(KEY_ACTION, 1));
     r.run(799).await;
     assert_eq!(r.events(), []);
     r.run(1).await;
     assert_eq!(r.events(), [LONG]);
     r.run(2000).await;
-    r.feed(Dev::Keys, &key(KEY_ACTION, 0));
+    r.feed(Dev::Keys(0), &key(KEY_ACTION, 0));
     assert_eq!(r.events(), []);
 }
 
@@ -119,35 +115,35 @@ async fn action_long_fires_while_held_and_the_release_adds_nothing() {
 async fn action_short_needs_56_ms_and_300_ms_gap() {
     let mut r = Rig::new();
     // Too short: capacitive noise.
-    r.feed(Dev::Keys, &key(KEY_ACTION, 1));
+    r.feed(Dev::Keys(0), &key(KEY_ACTION, 1));
     r.run(55).await;
-    r.feed(Dev::Keys, &key(KEY_ACTION, 0));
+    r.feed(Dev::Keys(0), &key(KEY_ACTION, 0));
     assert_eq!(r.events(), []);
-    r.feed(Dev::Keys, &key(KEY_ACTION, 1));
+    r.feed(Dev::Keys(0), &key(KEY_ACTION, 1));
     r.run(56).await;
-    r.feed(Dev::Keys, &key(KEY_ACTION, 0));
+    r.feed(Dev::Keys(0), &key(KEY_ACTION, 0));
     assert_eq!(r.events(), [SHORT]);
     // Released 299 ms after the accepted click (input.cpp: now - last < 300): dropped.
-    r.feed(Dev::Keys, &key(KEY_ACTION, 1));
+    r.feed(Dev::Keys(0), &key(KEY_ACTION, 1));
     r.run(299).await;
-    r.feed(Dev::Keys, &key(KEY_ACTION, 0));
+    r.feed(Dev::Keys(0), &key(KEY_ACTION, 0));
     assert_eq!(r.events(), []);
     // The dropped click does not move the gap: released 244 ms after it (543 ms after the
     // accepted one), the next click passes.
     r.run(144).await;
-    r.feed(Dev::Keys, &key(KEY_ACTION, 1));
+    r.feed(Dev::Keys(0), &key(KEY_ACTION, 1));
     r.run(100).await;
-    r.feed(Dev::Keys, &key(KEY_ACTION, 0));
+    r.feed(Dev::Keys(0), &key(KEY_ACTION, 0));
     assert_eq!(r.events(), [SHORT]);
 
     // Exactly 300 ms after the accepted click: accepted.
     let mut r = Rig::new();
-    r.feed(Dev::Keys, &key(KEY_ACTION, 1));
+    r.feed(Dev::Keys(0), &key(KEY_ACTION, 1));
     r.run(100).await;
-    r.feed(Dev::Keys, &key(KEY_ACTION, 0));
-    r.feed(Dev::Keys, &key(KEY_ACTION, 1));
+    r.feed(Dev::Keys(0), &key(KEY_ACTION, 0));
+    r.feed(Dev::Keys(0), &key(KEY_ACTION, 1));
     r.run(300).await;
-    r.feed(Dev::Keys, &key(KEY_ACTION, 0));
+    r.feed(Dev::Keys(0), &key(KEY_ACTION, 0));
     assert_eq!(r.events(), [SHORT, SHORT]);
 }
 
@@ -155,21 +151,21 @@ async fn action_short_needs_56_ms_and_300_ms_gap() {
 async fn queued_events_go_before_a_timer_of_the_same_wake_up() {
     // Released exactly when the long press comes due: the release wins (short), as in C++.
     let mut r = Rig::new();
-    r.feed(Dev::Keys, &key(KEY_ACTION, 1));
+    r.feed(Dev::Keys(0), &key(KEY_ACTION, 1));
     r.tick_with(&key(KEY_ACTION, 0)).await;
     assert_eq!(r.events(), [SHORT]);
     r.run(20_000).await;
     assert_eq!(r.events(), []);
 
     // Volume released when the repeat delay comes due: no repeat.
-    r.feed(Dev::Keys, &key(UP, 1));
+    r.feed(Dev::Keys(0), &key(UP, 1));
     assert_eq!(r.events(), [VOL_UP]);
     r.tick_with(&key(UP, 0)).await;
     r.run(2000).await;
     assert_eq!(r.events(), []);
 
     // ...and when a repeat comes due.
-    r.feed(Dev::Keys, &key(UP, 1));
+    r.feed(Dev::Keys(0), &key(UP, 1));
     r.run(500).await;
     assert_eq!(r.events(), [VOL_UP, VOL_UP]);
     r.tick_with(&key(UP, 0)).await;
@@ -177,7 +173,7 @@ async fn queued_events_go_before_a_timer_of_the_same_wake_up() {
     assert_eq!(r.events(), []);
 
     // An unrelated event first, then the timer still fires.
-    r.feed(Dev::Keys, &key(KEY_ACTION, 1));
+    r.feed(Dev::Keys(0), &key(KEY_ACTION, 1));
     r.tick_with(&key(KEY_VOLUMEDOWN, 1)).await;
     assert_eq!(
         r.events(),
@@ -188,7 +184,7 @@ async fn queued_events_go_before_a_timer_of_the_same_wake_up() {
 #[tokio::test(start_paused = true)]
 async fn volume_repeats_after_500_ms_every_200_ms_until_release() {
     let mut r = Rig::new();
-    r.feed(Dev::Keys, &key(UP, 1));
+    r.feed(Dev::Keys(0), &key(UP, 1));
     assert_eq!(r.events(), [VOL_UP]);
     r.run(499).await;
     assert_eq!(r.events(), []);
@@ -197,10 +193,10 @@ async fn volume_repeats_after_500_ms_every_200_ms_until_release() {
     r.run(600).await;
     assert_eq!(r.events(), [VOL_UP; 3]);
     // Autorepeat (value 2) and the other key's release change nothing.
-    r.feed(Dev::Keys, &key(UP, 2));
-    r.feed(Dev::Keys, &key(KEY_VOLUMEDOWN, 0));
+    r.feed(Dev::Keys(0), &key(UP, 2));
+    r.feed(Dev::Keys(0), &key(KEY_VOLUMEDOWN, 0));
     r.run(100).await;
-    r.feed(Dev::Keys, &key(UP, 0));
+    r.feed(Dev::Keys(0), &key(UP, 0));
     r.run(2000).await;
     assert_eq!(r.events(), []);
 }
@@ -208,19 +204,19 @@ async fn volume_repeats_after_500_ms_every_200_ms_until_release() {
 #[tokio::test(start_paused = true)]
 async fn stuck_keys_are_released_after_10_s() {
     let mut r = Rig::new();
-    r.feed(Dev::Keys, &key(UP, 1));
+    r.feed(Dev::Keys(0), &key(UP, 1));
     r.run(20_000).await;
     // Press, 500 ms, then every 200 ms while held <= 10 s: 500, 700, .., 9900.
     assert_eq!(r.events().len(), 1 + 48);
     assert!(r.m.repeat_code.is_none());
     assert!(!r.m.timers.is_set(Tick::Repeat));
 
-    r.feed(Dev::Keys, &key(KEY_ACTION, 1));
+    r.feed(Dev::Keys(0), &key(KEY_ACTION, 1));
     r.run(10_000).await;
     assert_eq!(r.events(), [LONG]);
     assert!(r.m.action_down.is_none());
     // The guard lets the next press through although the release never came.
-    r.feed(Dev::Keys, &key(KEY_ACTION, 1));
+    r.feed(Dev::Keys(0), &key(KEY_ACTION, 1));
     r.run(800).await;
     assert_eq!(r.events(), [LONG]);
 }
@@ -228,11 +224,11 @@ async fn stuck_keys_are_released_after_10_s() {
 #[tokio::test(start_paused = true)]
 async fn syn_dropped_resyncs_keys_from_the_device() {
     let mut r = Rig::new();
-    r.feed(Dev::Keys, &key(KEY_ACTION, 1));
+    r.feed(Dev::Keys(0), &key(KEY_ACTION, 1));
     r.run(100).await;
     // The release is lost in the overflow; the key state says nothing is held.
     r.feed(
-        Dev::Keys,
+        Dev::Keys(0),
         &[
             ev(EV_SYN, SYN_DROPPED, 0),
             ev(EV_KEY, KEY_ACTION, 0),
@@ -240,24 +236,24 @@ async fn syn_dropped_resyncs_keys_from_the_device() {
         ],
     );
     assert_eq!(r.events(), []);
-    r.feed(Dev::Keys, &[ev(EV_SYN, SYN_REPORT, 0)]);
+    r.feed(Dev::Keys(0), &[ev(EV_SYN, SYN_REPORT, 0)]);
     assert_eq!(r.events(), [SHORT]);
-    assert!(!r.m.keys_dropped);
+    assert!(!r.m.keys_dropped.iter().any(|&d| d));
 
     // Still held according to the device: nothing synthesized.
-    r.feed(Dev::Keys, &key(UP, 1));
+    r.feed(Dev::Keys(0), &key(UP, 1));
     assert_eq!(r.events(), [VOL_UP]);
     let mut held = [0u8; 96];
     held[usize::from(UP / 8)] |= 1 << (UP % 8);
     r.keys = Ok(held);
-    r.feed(Dev::Keys, &[ev(EV_SYN, SYN_DROPPED, 0)]);
-    r.feed(Dev::Keys, &[ev(EV_SYN, SYN_REPORT, 0)]);
+    r.feed(Dev::Keys(0), &[ev(EV_SYN, SYN_DROPPED, 0)]);
+    r.feed(Dev::Keys(0), &[ev(EV_SYN, SYN_REPORT, 0)]);
     assert_eq!(r.m.repeat_code, Some(UP));
 
     // EVIOCGKEY failing forgets every key.
     r.keys = Err(io::ErrorKind::NotFound.into());
-    r.feed(Dev::Keys, &[ev(EV_SYN, SYN_DROPPED, 0)]);
-    r.feed(Dev::Keys, &[ev(EV_SYN, SYN_REPORT, 0)]);
+    r.feed(Dev::Keys(0), &[ev(EV_SYN, SYN_DROPPED, 0)]);
+    r.feed(Dev::Keys(0), &[ev(EV_SYN, SYN_REPORT, 0)]);
     assert!(r.m.repeat_code.is_none());
     r.run(1000).await;
     assert_eq!(r.events(), []);
@@ -345,4 +341,35 @@ fn mute_gpio_is_an_active_low_input() {
     std::fs::write(line.join("value"), "1\n").unwrap();
     assert!(!gpio_muted(&f).unwrap());
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn alternate_action_keys_act_like_key_voicecommand() {
+    for code in [KEY_ACTION_MEDIA, KEY_ACTION_WWW] {
+        let mut r = Rig::new();
+        r.feed(Dev::Keys(1), &key(code, 1));
+        r.run(100).await;
+        r.feed(Dev::Keys(1), &key(code, 0));
+        assert_eq!(r.events(), [SHORT], "code {code}");
+        r.run(400).await; // the action gap limiter
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn key_mute_toggles_only_with_the_model_flag() {
+    let mut r = Rig::new();
+    r.m.keys_mute = true;
+    r.feed(Dev::Keys(0), &key(KEY_MUTE, 1));
+    assert_eq!(r.events(), [InputEvent::Mute(true)]);
+    assert!(r.m.muted.get());
+    // The release does nothing; the next press toggles back.
+    r.feed(Dev::Keys(0), &key(KEY_MUTE, 0));
+    assert_eq!(r.events(), []);
+    r.feed(Dev::Keys(0), &key(KEY_MUTE, 1));
+    assert_eq!(r.events(), [InputEvent::Mute(false)]);
+    assert!(!r.m.muted.get());
+    // Without Model::keys_mute, KEY_MUTE is ignored (the switch/GPIO state is authoritative).
+    let mut r = Rig::new();
+    r.feed(Dev::Keys(0), &key(KEY_MUTE, 1));
+    assert_eq!(r.events(), []);
 }

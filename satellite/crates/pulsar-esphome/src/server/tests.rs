@@ -516,7 +516,7 @@ async fn voice_owner_hands_over() {
             let mut a = Peer::connect(port).await;
             a.hello("HA").await;
             event(&mut rx).await;
-            assert_eq!(h.voice_request_start("Алиса"), 1);
+            assert_eq!(h.voice_request_start("Алиса", false), 1);
             a.subscribe_voice(true).await;
             a.sync().await;
             assert_eq!(event(&mut rx).await, ApiEvent::VoiceSubscribed(true));
@@ -532,7 +532,7 @@ async fn voice_owner_hands_over() {
             assert_eq!(event(&mut rx).await, ApiEvent::VoiceSubscribed(true));
             assert!(h.voice_subscribed());
 
-            assert_eq!(h.voice_request_start("Алиса"), 2);
+            assert_eq!(h.voice_request_start("Алиса", false), 2);
             let req = b.expect(msg::VA_REQUEST).await;
             assert!(field(&req, 1).unwrap().boolean());
             assert_eq!(field(&req, 5).unwrap().str(), "Алиса");
@@ -564,7 +564,7 @@ async fn voice_owner_hands_over() {
             drop(b);
             assert_eq!(event(&mut rx).await, ApiEvent::VoiceSubscribed(false));
             assert_eq!(event(&mut rx).await, ApiEvent::VoiceSubscribed(true));
-            h.voice_request_start("");
+            h.voice_request_start("", false);
             let req = a.expect(msg::VA_REQUEST).await;
             assert!(field(&req, 5).is_none());
 
@@ -575,7 +575,7 @@ async fn voice_owner_hands_over() {
             assert!(!h.voice_subscribed() && h.connected());
             assert!(rx.try_recv().is_err());
             // Without an owner the voice calls send nothing.
-            h.voice_request_start("x");
+            h.voice_request_start("x", false);
             h.voice_send_audio(vec![1]);
             h.voice_request_stop();
             assert!(a.sync().await.is_empty());
@@ -674,7 +674,7 @@ async fn audio_backlog_ends_the_run() {
             p.subscribe_voice(true).await;
             p.sync().await;
             assert_eq!(event(&mut rx).await, ApiEvent::VoiceSubscribed(true));
-            let run = h.voice_request_start("Алиса");
+            let run = h.voice_request_start("Алиса", false);
 
             let chunk = vec![7i16; 16384];
             let mut sent = 0;
@@ -699,7 +699,7 @@ async fn audio_backlog_ends_the_run() {
             assert!(audio[1..].iter().all(|m| m.0 == msg::VA_AUDIO));
             assert!(audio.len() - 1 < sent);
 
-            let run2 = h.voice_request_start("");
+            let run2 = h.voice_request_start("", false);
             assert_eq!(run2, run + 1);
             h.voice_send_audio(vec![1; 4]);
             let after = p.sync().await;
@@ -727,7 +727,7 @@ async fn client_not_reading_is_dropped() {
             p.subscribe_voice(true).await;
             p.sync().await;
             event(&mut rx).await;
-            h.voice_request_start("");
+            h.voice_request_start("", false);
             // One message larger than the 8 MiB backlog limit, while the backlog is still
             // under the audio limit: the client is given up.
             h.voice_send_audio(vec![0; (MAX_BACKLOG / 2) + (1 << 20)]);
@@ -1067,7 +1067,7 @@ async fn hand_over_drops_audio_stop_and_answer_report_of_the_old_run() {
             a.subscribe_voice(true).await;
             a.sync().await;
             assert_eq!(event(&mut rx).await, ApiEvent::VoiceSubscribed(true));
-            h.voice_request_start("Алиса");
+            h.voice_request_start("Алиса", false);
             a.expect(msg::VA_REQUEST).await;
             h.voice_send_audio(vec![1]);
             a.expect(msg::VA_AUDIO).await;
@@ -1090,7 +1090,7 @@ async fn hand_over_drops_audio_stop_and_answer_report_of_the_old_run() {
             assert_eq!(event(&mut rx).await, ApiEvent::VoiceSubscribed(true));
 
             // A new run on the new owner gets everything again.
-            h.voice_request_start("");
+            h.voice_request_start("", false);
             b.expect(msg::VA_REQUEST).await;
             h.voice_send_audio(vec![3]);
             b.expect(msg::VA_AUDIO).await;

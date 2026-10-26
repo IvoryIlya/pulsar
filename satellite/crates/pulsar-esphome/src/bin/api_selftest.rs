@@ -27,7 +27,7 @@ use pulsar_core::actors;
 use pulsar_esphome::{
     ApiConfig, ApiEvent, ApiHandle, BinarySensorId, ButtonId, DeviceIdentity, EventId, LightState,
     MediaCommand, MediaState, NumberId, SelectId, SensorId, SwitchId, TextId, TextSensorId,
-    WakeWordInfo, spawn,
+    UiFeatures, WakeWordInfo, spawn,
 };
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::{Instant, interval_at, sleep_until};
@@ -222,7 +222,7 @@ async fn voice_run(api: ApiHandle, stopped: Rc<Cell<bool>>) {
         return;
     }
     println!("TEST voice_request_start");
-    api.voice_request_start("Алиса");
+    api.voice_request_start("Алиса", false);
     let t0 = Instant::now();
     for i in 0..20u32 {
         if !wait_until(&stopped, t0 + Duration::from_millis(50 + u64::from(i) * 30)).await {
@@ -304,13 +304,15 @@ async fn run(port: u16, name: String, run_s: i64, key_path: Option<PathBuf>) -> 
         zigbee_modes: strings(&["Coordinator", "Router"]),
         has_clock: true,
         has_lux: true,
+        media_formats: Vec::new(),
+        ui: UiFeatures::default(),
         key_path,
     };
     let Ok((api, mut events)) = spawn(id, cfg) else {
         return ExitCode::from(1);
     };
     api.publish_media(MediaState::Idle, 0.5, false);
-    api.publish_switch(SwitchId::Microphones, true);
+    api.publish_switch(SwitchId::Microphones, false);
     api.publish_switch(SwitchId::Clock, true);
     api.publish_switch(SwitchId::VoiceIndication, true);
     api.publish_number(NumberId::LedSpeed, 1.0);

@@ -37,6 +37,8 @@ fn selftest(compilation_time: &str) -> (DeviceIdentity, ApiConfig) {
         zigbee_modes: s(&["Coordinator", "Router"]),
         has_clock: true,
         has_lux: true,
+        media_formats: Vec::new(),
+        ui: UiFeatures::default(),
         key_path: None,
     };
     (id, cfg)

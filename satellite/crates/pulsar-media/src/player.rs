@@ -20,6 +20,7 @@ use log::{debug, error, info, warn};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::gst::{self, Api, Call, MainLoop, Pipeline};
+use crate::wav;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Channel {
@@ -28,7 +29,7 @@ pub enum Channel {
 }
 
 impl Channel {
-    fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         self as usize
     }
 
@@ -285,7 +286,7 @@ impl Shared {
         }
     }
 
-    fn state(&self, ch: Channel) -> PlayState {
+    pub(crate) fn state(&self, ch: Channel) -> PlayState {
         PlayState::from_u8(self.states[ch.index()].load(Ordering::Relaxed))
     }
 
@@ -296,7 +297,7 @@ impl Shared {
 
     /// Caller side: `new` (a play()) or nothing (stop()) replaces the list whose Done is owed,
     /// which gets Done(false) now.
-    fn supersede(&self, ch: Channel, new: Option<PlayId>) {
+    pub(crate) fn supersede(&self, ch: Channel, new: Option<PlayId>) {
         let mut p = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(old) = std::mem::replace(&mut p[ch.index()], new) {
             self.send(PlayerEvent::Done { id: old, ok: false });
@@ -305,7 +306,17 @@ impl Shared {
 
     /// Delivers the result of list `id` unless a later play() / stop() superseded it meanwhile
     /// (that call already delivered false).
-    fn complete(&self, ch: Channel, id: PlayId, ok: bool) {
+    /// Publishes a channel state (event on a change); called by whichever worker plays.
+    pub(crate) fn set_state(&self, ch: Channel, s: PlayState) {
+        let prev = PlayState::from_u8(self.states[ch.index()].swap(s as u8, Ordering::Relaxed));
+        if prev == s {
+            return;
+        }
+        debug!("player: ch{} {} -> {}", ch.index(), prev.name(), s.name());
+        self.send(PlayerEvent::State(ch, s));
+    }
+
+    pub(crate) fn complete(&self, ch: Channel, id: PlayId, ok: bool) {
         let mut p = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
         if p[ch.index()] == Some(id) {
             p[ch.index()] = None;
@@ -379,13 +390,7 @@ impl Machine {
     }
 
     fn set_state(&mut self, ch: Channel, s: PlayState) {
-        let prev =
-            PlayState::from_u8(self.shared.states[ch.index()].swap(s as u8, Ordering::Relaxed));
-        if prev == s {
-            return;
-        }
-        debug!("player: ch{} {} -> {}", ch.index(), prev.name(), s.name());
-        self.shared.send(PlayerEvent::State(ch, s));
+        self.shared.set_state(ch, s);
     }
 
     fn loading_or_paused(&self, ch: Channel) -> PlayState {
@@ -882,8 +887,10 @@ fn start(shared: &Arc<Shared>, pcm: &str) -> Option<GlibThread> {
 struct Inner {
     shared: Arc<Shared>,
     next_id: Cell<u64>,
-    /// None: degraded (init failed), every play() is Done(false) at once.
+    /// The firmware GStreamer; None when it did not load.
     exec: Option<Box<dyn Exec>>,
+    /// The built-in WAV player; Some only without GStreamer.
+    wav: Option<wav::Handle>,
 }
 
 /// Player commands; the GLib thread stops when the last clone is dropped.
@@ -899,19 +906,30 @@ pub fn spawn(pcm: &str) -> (PlayerHandle, UnboundedReceiver<PlayerEvent>) {
     let (tx, rx) = unbounded_channel();
     let shared = Arc::new(Shared::new(tx));
     let exec = start(&shared, pcm).map(|t| Box::new(t) as Box<dyn Exec>);
-    if exec.is_none() {
+    let wav = if exec.is_none() {
+        warn!("GStreamer unavailable, using the built-in WAV player");
+        Some(wav::start(shared.clone(), pcm.to_owned()))
+    } else {
+        None
+    };
+    if exec.is_none() && wav.is_none() {
         error!("player init failed");
     }
-    (PlayerHandle::new(shared, exec), rx)
+    (PlayerHandle::new(shared, exec, wav), rx)
 }
 
 impl PlayerHandle {
-    fn new(shared: Arc<Shared>, exec: Option<Box<dyn Exec>>) -> PlayerHandle {
+    fn new(
+        shared: Arc<Shared>,
+        exec: Option<Box<dyn Exec>>,
+        wav: Option<wav::Handle>,
+    ) -> PlayerHandle {
         PlayerHandle {
             inner: Rc::new(Inner {
                 shared,
                 next_id: Cell::new(1),
                 exec,
+                wav,
             }),
         }
     }
@@ -932,6 +950,10 @@ impl PlayerHandle {
         let id = PlayId(self.inner.next_id.get());
         self.inner.next_id.set(id.0 + 1);
         self.inner.shared.supersede(ch, Some(id));
+        if let Some(wav) = &self.inner.wav {
+            wav.play(ch, id, urls);
+            return id;
+        }
         if self.inner.exec.is_none() {
             self.inner.shared.complete(ch, id, false);
         }
@@ -940,15 +962,24 @@ impl PlayerHandle {
     }
 
     pub fn pause(&self, ch: Channel) {
+        if let Some(wav) = &self.inner.wav {
+            return wav.pause(ch);
+        }
         self.invoke(move |m| m.pause(ch));
     }
 
     pub fn resume(&self, ch: Channel) {
+        if let Some(wav) = &self.inner.wav {
+            return wav.resume(ch);
+        }
         self.invoke(move |m| m.resume(ch));
     }
 
     pub fn stop(&self, ch: Channel) {
         self.inner.shared.supersede(ch, None);
+        if let Some(wav) = &self.inner.wav {
+            return wav.stop(ch);
+        }
         self.invoke(move |m| m.stop(ch));
     }
 
@@ -961,6 +992,9 @@ impl PlayerHandle {
     /// Per-channel gain 0..1 (ducking MUSIC while listening / speaking), ramped while playing.
     pub fn set_channel_gain(&self, ch: Channel, gain: f32) {
         let gain = clamp_gain(gain);
+        if let Some(wav) = &self.inner.wav {
+            return wav.set_gain(ch, gain);
+        }
         self.invoke(move |m| m.set_gain(ch, gain));
     }
 }
@@ -1209,7 +1243,7 @@ mod tests {
                 Arc::clone(&shared),
             )));
             let queue = Rc::new(RefCell::new(VecDeque::new()));
-            let h = PlayerHandle::new(shared, Some(Box::new(QueueExec(Rc::clone(&queue)))));
+            let h = PlayerHandle::new(shared, Some(Box::new(QueueExec(Rc::clone(&queue)))), None);
             Rig { h, rx, queue, fake }
         }
 
@@ -1717,8 +1751,11 @@ mod tests {
 
     #[test]
     fn degraded_player_fails_every_play_at_once() {
-        // No firmware GStreamer on the host: spawn() gives the degraded handle.
-        let (h, mut rx) = spawn("speakers");
+        // Neither backend: every play() ends with Done(false) at once (the handle part of
+        // spawn(); on a host without the firmware GStreamer spawn() itself falls back to the
+        // WAV player, tested below).
+        let (tx, mut rx) = unbounded_channel();
+        let h = PlayerHandle::new(Arc::new(Shared::new(tx)), None, None);
         let a = h.play(Music, urls(&["/a.mp3"]));
         assert_eq!(rx.try_recv().unwrap(), Done { id: a, ok: false });
         h.pause(Music);
@@ -1730,5 +1767,27 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert_eq!(h.state(Music), Idle);
         assert_eq!(h.state(Announce), Idle);
+    }
+
+    #[test]
+    fn fallback_player_fails_an_unopenable_file() {
+        // On a host without the firmware GStreamer, spawn() falls back to the WAV player: a
+        // file that cannot be opened reports Done(false) (asynchronously, behind whatever
+        // State events the backend publishes).
+        let (h, mut rx) = spawn("null");
+        let id = h.play(Announce, urls(&["/nonexistent-pulsar-test.wav"]));
+        let done = std::thread::scope(|scope| {
+            let t = scope.spawn(move || {
+                while let Some(ev) = rx.blocking_recv() {
+                    if let Done { id, ok } = ev {
+                        return (id, ok);
+                    }
+                }
+                (PlayId(0), true)
+            });
+            t.join().unwrap()
+        });
+        assert_eq!(done, (id, false));
+        drop(h);
     }
 }

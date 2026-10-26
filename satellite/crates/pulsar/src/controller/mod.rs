@@ -15,7 +15,7 @@ use log::{debug, error, info, warn};
 use pulsar_audio::FrontendEvent;
 use pulsar_core::model::Model;
 use pulsar_core::{ClockShot, Timers, UiState, now_ms};
-use pulsar_esphome::{ApiConfig, ApiEvent, ApiHandle, WakeWordInfo};
+use pulsar_esphome::{ApiConfig, ApiEvent, ApiHandle, MediaFormat, UiFeatures, WakeWordInfo};
 use pulsar_hw::{InputEvent, InputHandle, LedsHandle, Rgb};
 use pulsar_lan::arbiter::{self, ArbiterEvent, ArbiterHandle};
 use pulsar_lan::mdns::{self, MdnsHandle, MdnsService};
@@ -32,7 +32,6 @@ use logic::{HaTimer, Phase, RunBinding};
 
 const MODELS: &str = "/system/vendor/quasar/spotter_models/activation/";
 const COMMAND_MODEL: &str = "/system/vendor/quasar/spotter_models/command";
-const SOUNDS: &str = "/system/vendor/quasar/sounds/";
 
 const DUCK_GAIN: f32 = 0.15;
 const TIMER_RING_MAX_MS: i64 = 15 * 60 * 1000;
@@ -80,6 +79,8 @@ enum Tk {
     TimerTick,
     /// Next round of the timer ring.
     RingTick,
+    /// Re-open the Home Assistant wake word run (models without a device engine).
+    WakeRearm,
     UpdateCheck,
     /// An automatic install waits for idle.
     UpdateRetry,
@@ -173,6 +174,12 @@ pub struct Controller {
     /// Another station answers the wake word just heard.
     commands_blocked_until_ms: i64,
     run: RunBinding,
+    /// The model has no device wake word: Home Assistant detects it on a run this device keeps
+    /// open and streaming while idle (Phase::WakeListen).
+    ha_wake: bool,
+    /// Consecutive HA wake word runs that ended without reaching speech recognition (re-arm
+    /// backoff, logic::ha_wake_rearm_ms).
+    wake_fails: u32,
     /// voice_request_stop already sent for this dialog's run.
     stop_sent: bool,
     /// Id of the last voice_request_start: VoiceStartFailed / VoiceAudioOverflow of another
@@ -297,9 +304,11 @@ impl Controller {
         let dir = logic::state_dir(state_path.as_os_str());
         let strings = |l: &[&str]| l.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         let with_none = |l: Vec<String>| std::iter::once("None".to_owned()).chain(l).collect();
-        let cfg = ApiConfig {
-            port: ports.api,
-            wake_words: vec![
+        let has_engine = model.has_engine();
+        // Without the firmware's spotter there is no device wake word: none is advertised, and
+        // HA runs its own (openWakeWord) on the audio of the run the device keeps open.
+        let wake_words = if has_engine {
+            vec![
                 WakeWordInfo {
                     id: "alisa".into(),
                     phrase: "Алиса".into(),
@@ -310,8 +319,41 @@ impl Controller {
                     phrase: "Яндекс".into(),
                     languages: vec!["ru".into()],
                 },
-            ],
-            active_wake_words: vec![st.wake_word.clone()],
+            ]
+        } else {
+            Vec::new()
+        };
+        // Without a loadable GStreamer the built-in WAV player is the backend: advertise 16 kHz
+        // mono WAV so HA transcodes TTS and announcements to it (its ffmpeg proxy).
+        let media_formats = if has_engine {
+            Vec::new() // the FLAC/48 kHz default of the API server
+        } else {
+            [false, true]
+                .iter()
+                .map(|&ann| MediaFormat {
+                    format: "wav".into(),
+                    rate: 16000,
+                    channels: 1,
+                    sample_bytes: 2,
+                    announcement: ann,
+                })
+                .collect()
+        };
+        let cfg = ApiConfig {
+            port: ports.api,
+            wake_words,
+            active_wake_words: if has_engine {
+                vec![st.wake_word.clone()]
+            } else {
+                Vec::new()
+            },
+            media_formats,
+            ui: UiFeatures {
+                leds: model.ring.count > 0 || model.logo.count > 0,
+                keys: !model.keys_input.is_empty(),
+                hw_mute: !model.mute_input.is_empty() || model.mute_gpio != 0 || model.keys_mute,
+                device_wake_word: has_engine,
+            },
             light_effects: strings(pulsar_hw::effect_names()),
             clock_faces: with_none(strings(pulsar_clock::face_names())),
             music_styles: strings(pulsar_hw::music_styles()),
@@ -562,6 +604,8 @@ impl Controller {
             arb_command: String::new(),
             commands_blocked_until_ms: 0,
             run: RunBinding::default(),
+            ha_wake: !model.has_engine(),
+            wake_fails: 0,
             stop_sent: false,
             voice_run: 0,
             tts_url: String::new(),
@@ -713,6 +757,7 @@ impl Controller {
             Tk::Watchdog => self.abort_dialog("no progress from Home Assistant, giving up"),
             Tk::TimerTick => self.show_timers(),
             Tk::RingTick => self.ring_timer(),
+            Tk::WakeRearm => self.maybe_arm_ha_wake(),
             Tk::UpdateCheck => self.check_update(),
             Tk::UpdateRetry => self.maybe_auto_update(),
             // exit 0: supervise.sh starts the new binary
@@ -748,7 +793,7 @@ impl Controller {
             FrontendEvent::Wake { phrase, level_db } => self.on_wake(&phrase, level_db),
             FrontendEvent::Command { word } => self.on_command(&word, false),
             FrontendEvent::Audio(pcm) => {
-                if self.phase == Phase::Listening {
+                if matches!(self.phase, Phase::Listening | Phase::WakeListen) {
                     self.api.voice_send_audio(pcm);
                 } else if self.arbitrating {
                     // The request goes on with what was said right after the wake word.
@@ -808,6 +853,8 @@ impl Controller {
                 Phase::Listening => UiState::Listening,
                 Phase::Processing => UiState::Thinking,
                 Phase::Speaking => UiState::Speaking,
+                // Waiting for HA's wake word is the idle state of the device.
+                Phase::WakeListen => UiState::Idle,
                 Phase::Idle if self.arbitrating => UiState::Listening,
                 Phase::Idle if self.announcing => UiState::Speaking,
                 Phase::Idle => UiState::Idle,

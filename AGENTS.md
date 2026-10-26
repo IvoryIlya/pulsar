@@ -9,7 +9,10 @@ live stations: `docs/stations.md` (Russian) with `tools/station.sh`.
 A native Rust daemon replacing the Yandex stack (`maind` / `quasar_launcher2`) on rooted Yandex
 Stations: Midi (`cucumber`: usually aarch64, glibc 2.36, 1 GB RAM; some images run a 32-bit
 armhf userland), Lite 2 (`plum`: 32-bit armhf, glibc 2.30, 237 MB RAM) and Mini 2
-(`station-mini2`: 32-bit armhf userland on an aarch64 kernel, glibc 2.30, 238 MB RAM). It exposes
+(`station-mini2`: 32-bit armhf userland on an aarch64 kernel, glibc 2.30, 238 MB RAM). An
+experimental port runs on the Irbis A speaker (`irbisA`, Amlogic A113X, generic devicetree,
+ssh transport, glibc 2.23 sidecar, no Yandex engine: the wake word runs in Home Assistant,
+playback is the built-in WAV player) — see `docs/irbis-a.md`. It exposes
 the speaker to Home Assistant over the ESPHome Native API (port 6053; plaintext until a Noise key is
 provisioned, then Noise) and to Music Assistant as a Sendspin player (port 8928); on the Midi
 its Zigbee radio runs pulsar's own firmware (`radio/`): a deCONZ-protocol network coordinator for
@@ -36,7 +39,7 @@ UDP broadcast (port 6054) so that only the one that heard it loudest answers.
 | `satellite/crates/pulsar-zigbee/` | Midi Zigbee radio: zbhci link to the Telink chip (`link.rs`), coordinator on pulsar's firmware + ZDO to the coordinator itself (`coordinator.rs`), deCONZ-protocol TCP server for Zigbee2MQTT / ZHA (`deconz.rs`), router control (`router.rs`), `.ybl` parsing + XMODEM upload through the radio's bootloader (`flasher.rs`), role / firmware orchestration (`service.rs`), role table (`roles.rs`), byte order helpers (`bytes.rs`); bin `zigbee_probe [port] \| info \| flash <image>` (coordinator + deCONZ server on another port without the daemon; firmware identification; writing an image) |
 | `satellite/crates/pulsar-update/` | HA "Firmware" update entity backend: HTTPS with rustls + ring (`https.rs`), GitHub release check / download / verify / swap (`updater.rs`), version comparison (`version.rs`); bin `update_probe` |
 | `satellite/crates/*/src/bin/` | tools (`make ARCH=<arch> tools`): `alsa_abi_probe` (ALSA hw-params ABI on the `null` PCM, no sound), `api_selftest` (API server with printing handlers, `[port=16053] [name] [run_seconds=120] [key_file]`), `lan_probe` (mDNS / arbiter probes on alternative ports), `ww_offline` (offline spotter test on a raw capture WAV), `frontend_probe` (microphone front-end without the daemon: events, rates, `--record` of the raw capture), `player_probe` (music / announce / http / 404 / https scenario at volume ≤ 0.2, original raw restored), `sendspin_probe` (Sendspin player without the daemon on another port, Master volume capped at 0.2, for `tools/sendspin_server.py`), `hw_probe` (LEDs, clock, input, light sensor), `update_probe` (HTTPS client, release check, install into a scratch dir), `zigbee_probe` |
-| `satellite/deploy/` | `dist.sh` (release archives, host side); `boot.sh`, `supervise.sh`, `ctl.sh` (device side) |
+| `satellite/deploy/` | `dist.sh` (release archives, host side); `boot.sh`, `supervise.sh`, `ctl.sh` (device side); `irbis/` (the Irbis A asoundrc block, earcon WAVs and stock-stack hooks); `glibc/` (`fetch.py`: the armhf glibc sidecar for old-libc ports — the Irbis A's glibc 2.23 cannot load the daemon, `supervise.sh` runs it through the sidecar's loader) |
 | `satellite/third_party/` | `fetch.sh` (pinned deps), CMake glue, zig toolchain wrappers (sendspin-cpp only; with the shim in `crates/pulsar-sendspin/shim/` the only C++ in the build) |
 | `installer/` | `pulsar-install` (Go): station discovery (mDNS legacy-unicast query / `--scan` port scan), adb (downloads platform-tools 37.0.1 if missing), install (incl. `/etc/init.d/S99zpulsar`), health check |
 | `ssh/` | `build.sh` (static dropbear + sftp-server), `start.sh` (device side) |
@@ -111,17 +114,27 @@ go -C installer run . --list         # discover stations (mDNS; --scan = adb por
 go -C installer run . <ip>[:port]    # build if needed, copy binary (+ .prev), write /etc/init.d/S99zpulsar, restart
 ```
 
-Models are identified by `/proc/device-tree/compatible` (`yandex,<codename>`) both by the daemon
-(`detect_model()`, exits on unknown hardware) and by the installer (`modelName()`, `abis()`,
-`archOf()` in `installer/probe.go`). The installer skips a station whose adb is not root (`id -u`)
+Models are identified by `/proc/device-tree/compatible` (`yandex,<codename>`, `irbis,<board>`)
+both by the daemon (`detect_model()`, exits on unknown hardware; `PULSAR_MODEL=<codename>` or the
+first line of `/data/pulsar/model` overrides the check on ports with a generic devicetree —
+`boot.sh` honours the same file, and `pulsar-install --model=<codename>` writes it) and by the
+installer (`modelName()`, `abis()`, `archOf()`, `stationCode()` in `installer/probe.go`). Targets
+of the form `ssh://[user@]host[:port]` (or `user@host`) install over ssh/scp instead of adb
+(`installer/ssh.go`); an `irbisA` install also writes the `/root/.asoundrc` block, the earcons,
+the glibc sidecar and the default stock-stack hooks (`deployIrbisAudio`, `deployGlibc`,
+`deployIrbisOem`). The installer skips a station whose adb is not root (`id -u`)
 before probing its loaders. The binary is `build/<arch>/pulsar` for the model's first ABI in
 `abis()` whose dynamic loader is on the station (`/lib/ld-linux-aarch64.so.1`,
 `/lib/ld-linux-armhf.so.3`): its usual one, or for the Midi the armhf build on images with only
 that loader (#13). A Lite 2 or Mini 2 without the armhf loader is skipped (no 64-bit userspace
 has been seen on them, and the aarch64 binary needs glibc 2.34). Adding a model: hardware study
-first (ALSA capture layout, VQE preset, spotter channels, LEDs, clock, inputs, earcons), then a
-`Model` in `satellite/crates/pulsar-core/src/model.rs` and `modelName()` / `abis()` entries. A
-second ABI in `abis()` is only for a userspace that has actually been seen on that model.
+first (ALSA capture layout, VQE preset or its absence — an empty `vqe_preset` selects the direct
+front-end and the Home Assistant wake word, spotter channels, LEDs, clock, inputs, earcons), then
+a `Model` in `satellite/crates/pulsar-core/src/model.rs` and `modelName()` / `abis()` entries. A
+second ABI in `abis()` is only for a userspace that has actually been seen on that model. The
+armhf build's glibc floor is `ARMHF_GLIBC` (default 2.30); below glibc 2.28 (Rust's own floor)
+the sidecar of `satellite/deploy/glibc/` runs the daemon through a deployed newer loader/libc.
+Worked example of a non-Yandex port: `docs/irbis-a.md`.
 
 Manual binary update (e.g. over ssh):
 

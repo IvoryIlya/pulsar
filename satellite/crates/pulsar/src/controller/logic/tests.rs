@@ -310,6 +310,9 @@ fn ducking() {
         assert!(want_duck(phase, false, false, false));
     }
     assert!(want_duck(Phase::Idle, true, false, false));
+    // An open Home Assistant wake word run is the idle state of an engine-less device: no duck.
+    assert!(!want_duck(Phase::WakeListen, false, false, false));
+    assert!(want_duck(Phase::WakeListen, true, false, false));
     assert!(want_duck(Phase::Idle, false, true, false));
     assert!(want_duck(Phase::Idle, false, false, true));
 }
@@ -584,4 +587,35 @@ fn microphones_mutes() {
     assert!(!sw_mute_after_button(true, false));
     // The button never sets the software mute.
     assert!(!sw_mute_after_button(false, true));
+}
+
+#[test]
+fn ha_wake_rearm_backs_off_to_30_s() {
+    assert_eq!(ha_wake_rearm_ms(0), 500);
+    assert_eq!(ha_wake_rearm_ms(1), 1_000);
+    assert_eq!(ha_wake_rearm_ms(2), 2_000);
+    assert_eq!(ha_wake_rearm_ms(5), 16_000);
+    assert_eq!(ha_wake_rearm_ms(6), 30_000);
+    assert_eq!(ha_wake_rearm_ms(100), 30_000);
+}
+
+#[test]
+fn wake_listen_is_idle_for_updates() {
+    // A re-arm of the wake word run must not keep an automatic update waiting forever.
+    assert!(idle_for_update(
+        Phase::WakeListen,
+        false,
+        false,
+        PlayState::Idle,
+        false,
+        false
+    ));
+    assert!(!idle_for_update(
+        Phase::Listening,
+        false,
+        false,
+        PlayState::Idle,
+        false,
+        false
+    ));
 }

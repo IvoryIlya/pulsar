@@ -72,15 +72,18 @@ impl ApiHandle {
     }
 
     /// Starts a pipeline run (VoiceAssistantRequest start=true) on the voice owner; an empty
-    /// phrase means started by the button or to continue a conversation. Returns the run id
-    /// (1, 2, …) that `VoiceStartFailed` and `VoiceAudioOverflow` carry when they happen
-    /// during this run.
-    pub fn voice_request_start(&self, wake_word_phrase: &str) -> u64 {
+    /// phrase means started by the button or to continue a conversation. `wake_word_in_ha`
+    /// (the USE_WAKE_WORD command flag) asks HA to run its wake word stage on the audio this
+    /// run streams — for devices with no spotter of their own; the run then stays open until HA
+    /// hears a wake word (or gives up). Returns the run id (1, 2, …) that `VoiceStartFailed`
+    /// and `VoiceAudioOverflow` carry when they happen during this run.
+    pub fn voice_request_start(&self, wake_word_phrase: &str, wake_word_in_ha: bool) -> u64 {
         let run = self.shared.run_seq.get() + 1;
         self.shared.run_seq.set(run);
         self.send(Cmd::VoiceRequestStart {
             run,
             phrase: wake_word_phrase.to_owned(),
+            ha_wake: wake_word_in_ha,
         });
         run
     }

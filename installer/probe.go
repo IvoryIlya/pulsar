@@ -16,6 +16,8 @@ func modelName(code string) string {
 		return "Yandex Station Lite 2"
 	case "station-mini2":
 		return "Yandex Station Mini 2"
+	case "irbisA":
+		return "Irbis A"
 	}
 	return ""
 }
@@ -32,6 +34,11 @@ func abis(code string) []string {
 	case "cucumber":
 		return []string{"aarch64", "armhf"}
 	case "plum", "station-mini2":
+		return []string{"armhf"}
+	case "irbisA":
+		// Seen on the device: a 64-bit kernel (4.9, aarch64) with a 32-bit armhf userland
+		// (glibc 2.23 — the daemon runs through the deployed glibc sidecar; the armhf build's
+		// own floor is the Makefile's ARMHF_GLIBC, and the probe prints the device libc).
 		return []string{"armhf"}
 	}
 	return nil
@@ -53,8 +60,14 @@ func archOf(code string, loaders []string) string {
 func hasZigbee(code string) bool { return code == "cucumber" }
 
 type station struct {
-	serial, arch string
-	zigbee       bool
+	serial string
+	// Devicetree codename (modelName).
+	code   string
+	arch   string
+	zigbee bool
+	// The codename came from --model or /data/pulsar/model, not the devicetree: the install
+	// writes /data/pulsar/model so the daemon and boot.sh find the model too.
+	modelOverride bool
 }
 
 // found: installable stations, in the order printed by probe.
@@ -68,6 +81,10 @@ var found []station
 func stationCode(compat string) (string, bool) {
 	var first string
 	for _, entry := range strings.Fields(compat) {
+		if board, ok := strings.CutPrefix(entry, "irbis,"); ok && board != "" {
+			// Any Irbis board maps to the one ported model until a second one exists.
+			return "irbisA", true
+		}
 		code, ok := strings.CutPrefix(entry, "yandex,")
 		if !ok || code == "" {
 			continue
@@ -93,12 +110,28 @@ func probe(s string, ours bool) {
 	}
 	compat, err := sh(s, `tr '\0' '\n' </proc/device-tree/compatible`)
 	if err != nil {
-		skip("adb not usable (unauthorized or offline)")
+		if isSSH(s) {
+			skip("ssh not usable (host down, or no key/root login)")
+		} else {
+			skip("adb not usable (unauthorized or offline)")
+		}
 		return
 	}
 	code, supported := stationCode(compat)
+	viaOverride := false
+	if code == "" || !supported {
+		// A generic devicetree (the Irbis A reports only "amlogic, axg"): --model decides,
+		// else the model file an earlier install wrote.
+		if opts.model != "" {
+			code, supported, viaOverride = opts.model, true, true
+		} else if m, err := sh(s, "head -n1 "+dataDir+"/model 2>/dev/null"); err == nil {
+			if m = strings.TrimSpace(m); modelName(m) != "" {
+				code, supported, viaOverride = m, true, true
+			}
+		}
+	}
 	if code == "" {
-		skip("not a Yandex Station")
+		skip("not a supported station (a port with a generic devicetree needs --model=<codename>)")
 		return
 	}
 	name := modelName(code)
@@ -111,14 +144,14 @@ func probe(s string, ours bool) {
 		return
 	}
 	if uid, _ := sh(s, "id -u"); uid != "0" {
-		skip(name + " — adb is not root, skipped")
+		skip(name + " — the shell is not root, skipped")
 		return
 	}
 	// `; true`: a missing loader is not an error. Without it the last [ -x ] exits 1 on a
 	// normal Midi (no armhf loader) and sh() reports a failure that is not an adb failure.
 	loaders, err := sh(s, `[ -x /lib/ld-linux-aarch64.so.1 ] && echo aarch64; [ -x /lib/ld-linux-armhf.so.3 ] && echo armhf; true`)
 	if err != nil {
-		skip("adb not usable (unauthorized or offline)")
+		skip("the device shell is not usable")
 		return
 	}
 	arch := archOf(code, strings.Fields(loaders))
@@ -131,13 +164,26 @@ func probe(s string, ours bool) {
 		state = "satellite running"
 	} else if _, err := sh(s, "[ -x "+dataDir+"/pulsar ]"); err == nil {
 		state = "satellite installed, not running"
+	} else if code == "irbisA" {
+		state = "stock firmware"
 	} else {
 		state = "stock Yandex"
 	}
-	found = append(found, station{s, arch, hasZigbee(code)})
+	found = append(found, station{s, code, arch, hasZigbee(code), viaOverride})
 	note := ""
 	if arch != abis(code)[0] {
 		note = ", " + arch + " build"
+	}
+	if viaOverride {
+		note += ", model via override"
+	}
+	if code == "irbisA" {
+		// The armhf build's glibc floor (satellite/Makefile ARMHF_GLIBC) matters on this
+		// device: the daemon runs through the deployed sidecar, but the sidecar's loader
+		// still needs the kernel's floor kept, and the printout catches a wrong sidecar.
+		if g, err := sh(s, `/lib/libc.so.6 2>/dev/null | head -1 || ldd --version 2>/dev/null | head -1 || true`); err == nil && strings.TrimSpace(g) != "" {
+			note += "; device libc: " + strings.TrimSpace(g)
+		}
 	}
 	fmt.Printf("  [%d] %s: %s — %s%s\n", len(found), s, name, state, note)
 }

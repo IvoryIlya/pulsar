@@ -22,6 +22,10 @@ pub const PAUSED_MUSIC_MS: i64 = 2 * 60 * 60 * 1000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Idle,
+    /// A Home Assistant wake word run is open and streaming (models without a device engine):
+    /// HA listens for its wake word on the audio. Not a dialog: nothing is ducked and the UI
+    /// stays idle; the first speech-recognition event turns it into Listening.
+    WakeListen,
     Listening,
     Processing,
     Speaking,
@@ -122,7 +126,7 @@ pub fn identity(
         mac,
         model: model.model_name.into(),
         board: model.codename.into(),
-        manufacturer: "Yandex".into(),
+        manufacturer: model.manufacturer.into(),
         project_version: version.into(),
         compilation_time: compilation_time.into(),
     }
@@ -314,7 +318,18 @@ pub fn want_duck(
     timer_ringing: bool,
     closing_earcon: bool,
 ) -> bool {
-    phase != Phase::Idle || announcing || timer_ringing || closing_earcon
+    // A Home Assistant wake word run stays open indefinitely; it must not duck the music.
+    !matches!(phase, Phase::Idle | Phase::WakeListen)
+        || announcing
+        || timer_ringing
+        || closing_earcon
+}
+
+/// The re-arm delay of the Home Assistant wake word run after `fails` consecutive runs that
+/// ended without ever reaching speech recognition: 500 ms, doubling up to 30 s (a pipeline
+/// without a wake word provider would otherwise spin).
+pub fn ha_wake_rearm_ms(fails: u32) -> u64 {
+    (500u64 << fails.min(6)).min(30_000)
 }
 
 /// A local volume change clicks on ANNOUNCE, which also carries the answer, announcements, the
@@ -363,7 +378,9 @@ pub fn idle_for_update(
     sendspin_streaming: bool,
     zigbee_flashing: bool,
 ) -> bool {
-    phase == Phase::Idle
+    // An open Home Assistant wake word run does not hold the speaker: an update may restart
+    // the daemon (HA re-arms the run when it reconnects).
+    matches!(phase, Phase::Idle | Phase::WakeListen)
         && !announcing
         && !timer_ringing
         && music != PlayState::Playing

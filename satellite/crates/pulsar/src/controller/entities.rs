@@ -138,12 +138,18 @@ impl Controller {
                     logic::sw_mute_after_switch(state, self.st.mic_muted, self.hw_mic_muted);
                 if !state {
                     self.cancel_arbitration();
-                    if self.phase == logic::Phase::Listening {
+                    if matches!(
+                        self.phase,
+                        logic::Phase::Listening | logic::Phase::WakeListen
+                    ) {
                         self.finish_interaction();
                     }
                 }
                 self.update_detection();
                 self.update_ui();
+                if state {
+                    self.maybe_arm_ha_wake();
+                }
                 // The actual state, not the command: "on" under the button mute comes back off.
                 self.publish_microphones();
                 // Privacy: a mute must not be undone by a power cut right after it. A failed
@@ -345,8 +351,10 @@ impl Controller {
         self.st.wake_word = first;
         info!("wake word -> {}", self.st.wake_word);
         self.mic.set_model(model_dir(&self.st.wake_word));
-        self.api
-            .set_active_wake_words(vec![self.st.wake_word.clone()]);
+        if self.model.has_engine() {
+            self.api
+                .set_active_wake_words(vec![self.st.wake_word.clone()]);
+        }
         self.persist();
     }
 
@@ -369,11 +377,17 @@ impl Controller {
                     self.persist();
                 }
                 self.publish_microphones();
-                if m && self.phase == logic::Phase::Listening {
+                if m && matches!(
+                    self.phase,
+                    logic::Phase::Listening | logic::Phase::WakeListen
+                ) {
                     self.finish_interaction();
                 }
                 self.update_detection();
                 self.update_ui();
+                if !m {
+                    self.maybe_arm_ha_wake();
+                }
             }
             InputEvent::Button(Button::Action, p) => {
                 self.api.fire_event(

@@ -57,20 +57,41 @@ func startServer() bool {
 
 func adbCmd(args ...string) *exec.Cmd { return exec.Command(adbPath, args...) }
 
+// push copies one file to the device (adb push, or scp -O for an ssh:// target).
 func push(s, local, remote string) error {
+	if isSSH(s) {
+		return scpPush(s, local, remote)
+	}
 	c := adbCmd("-s", s, "push", local, remote)
 	c.Stderr = os.Stderr
 	return c.Run()
 }
 
+// pull copies one file from the device.
 func pull(s, remote, local string) error {
+	if isSSH(s) {
+		return scpPull(s, remote, local)
+	}
 	c := adbCmd("-s", s, "pull", remote, local)
 	c.Stderr = os.Stderr
 	return c.Run()
 }
 
-func connect(s string)    { _ = adbCmd("connect", s).Run() }
-func disconnect(s string) { _ = adbCmd("disconnect", s).Run() }
+// connect prepares the target: adb connects; an ssh target only needs its scp applet, which the
+// first push ensures anyway.
+func connect(s string) {
+	if isSSH(s) {
+		return
+	}
+	_ = adbCmd("connect", s).Run()
+}
+
+func disconnect(s string) {
+	if isSSH(s) {
+		return
+	}
+	_ = adbCmd("disconnect", s).Run()
+}
 
 var networkSerial = regexp.MustCompile(`:[0-9]+$`)
 
@@ -97,6 +118,9 @@ func networkDevices() []string {
 }
 
 func isConnected(s string) bool {
+	if isSSH(s) {
+		return sshReachable(s)
+	}
 	for _, d := range devices() {
 		if d == s {
 			return true
@@ -111,6 +135,9 @@ var errNoStatus = errors.New("no exit status")
 // failures or a non-zero remote status. adb shell on these firmwares always exits 0 and adds \r:
 // the remote status is carried in the output.
 func shRaw(serial, cmd string) (string, error) {
+	if isSSH(serial) {
+		return sshRaw(serial, cmd)
+	}
 	b, err := adbCmd("-s", serial, "shell", cmd+"\necho __rc=$?").Output()
 	if err != nil {
 		return "", err

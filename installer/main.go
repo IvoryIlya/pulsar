@@ -19,11 +19,24 @@ const (
 
 const usage = `pulsar-install: finds rooted Yandex Stations on the local network and installs or updates pulsar.
 
-  pulsar-install [--list] [--scan] [--ssh] [--no-enable] [--yes] [ip[:port] ...]
+  pulsar-install [--list] [--scan] [--ssh] [--no-enable] [--yes] [--model=<codename>]
+                 [ip[:port] | ssh://[user@]host[:port] ...]
 
 Without addresses: finds Yandex Stations via mDNS or, with --scan, by scanning the /24
 of the default-route interface for adb (port 5555); connects, identifies the model and offers
-the supported, rooted stations found. Per station:
+the supported, rooted stations found.
+
+An ssh:// target (or user@host[:port]) installs over ssh/scp instead of adb, for stations whose
+firmware has no adbd (the Irbis A): root login with a key is expected (ssh-copy-id), and file
+copies use scp -O against the firmware's dropbear (the installer symlinks /usr/bin/scp to
+dropbearmulti when the device has no scp applet). Irbis A installs also write the daemon's ALSA
+config to /root/.asoundrc (the marked pulsar block: pulsar_mic capture plug, speakers =
+softvol over the firmware's dmixer_auto) and the earcon WAVs to /data/pulsar/sounds.
+
+--model=<codename> forces the model on targets whose devicetree compatible names nothing known
+(the Irbis A reports only "amlogic, axg"): pulsar-install --model=irbisA ssh://root@<ip>. The
+codename is written to /data/pulsar/model, which the daemon and boot.sh read when the
+devicetree check fails. Per station:
 - copies the daemon + scripts to /data/pulsar (scripts via .new + mv; when the binary
   differs from the installed one, the installed one is kept as .prev; an identical one is not
   copied and leaves .prev alone);
@@ -49,6 +62,10 @@ from dl.google.com (Android SDK Platform-Tools 37.0.1; Google's terms apply).
 type options struct {
 	ssh, noEnable, yes, list, scan bool
 	targets                        []string
+	// --model=<codename>: the model to install on targets whose devicetree names nothing
+	// known (bring-up of a port; the Irbis A reports only the generic "amlogic, axg"). The
+	// codename is also written to /data/pulsar/model, which the daemon and boot.sh honour.
+	model string
 }
 
 var (
@@ -82,8 +99,20 @@ func parseArgs(args []string) (options, error) {
 			o.scan = true
 		case a == "-h" || a == "--help":
 			return o, errHelp
+		case strings.HasPrefix(a, "--model="):
+			o.model = strings.TrimPrefix(a, "--model=")
+			if modelName(o.model) == "" {
+				return o, fmt.Errorf("unknown model %s (--model=cucumber|plum|irbisA)", o.model)
+			}
 		case strings.HasPrefix(a, "-"):
 			return o, fmt.Errorf("unknown option %s", a)
+		case strings.HasPrefix(a, "ssh://") || strings.Contains(a, "@"):
+			// A station without adb (Irbis A): root ssh, copies over scp -O.
+			n := normalizeSSH(a)
+			if n == "" {
+				return o, fmt.Errorf("bad ssh target %s (want ssh://[user@]host[:port])", a)
+			}
+			o.targets = append(o.targets, n)
 		case strings.Contains(a, ":"):
 			o.targets = append(o.targets, a)
 		default:
@@ -144,7 +173,15 @@ func run() int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	if !findAdb() || !startServer() {
+	// ssh-only targets (Irbis A) need no adb; discovery without targets always does.
+	allSSH := len(opts.targets) > 0
+	for _, t := range opts.targets {
+		if !isSSH(t) {
+			allSSH = false
+			break
+		}
+	}
+	if !allSSH && (!findAdb() || !startServer()) {
 		return 1
 	}
 	if !opts.list && !build() {

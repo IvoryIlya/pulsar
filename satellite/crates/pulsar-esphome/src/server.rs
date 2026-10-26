@@ -185,7 +185,11 @@ pub(crate) struct Shared {
 }
 
 pub(crate) enum Cmd {
-    VoiceRequestStart { run: u64, phrase: String },
+    VoiceRequestStart {
+        run: u64,
+        phrase: String,
+        ha_wake: bool,
+    },
     VoiceRequestStop,
     VoiceSendAudio(Vec<i16>),
     VoiceAnnounceFinished(bool),
@@ -1411,7 +1415,11 @@ impl Server {
 
     fn command(&mut self, cmd: Cmd) {
         match cmd {
-            Cmd::VoiceRequestStart { run, phrase } => self.voice_request_start(run, &phrase),
+            Cmd::VoiceRequestStart {
+                run,
+                phrase,
+                ha_wake,
+            } => self.voice_request_start(run, &phrase, ha_wake),
             // Stale: meant for the run of the previous owner.
             Cmd::VoiceRequestStop | Cmd::VoiceSendAudio(_) | Cmd::VoiceAnswerFinished(_)
                 if self.voice_stale => {}
@@ -1425,8 +1433,10 @@ impl Server {
         }
     }
 
-    /// `phrase` empty: started by the button or to continue a conversation.
-    fn voice_request_start(&mut self, run: u64, phrase: &str) {
+    /// `phrase` empty: started by the button or to continue a conversation. `ha_wake`: the run
+    /// asks HA to do the wake word detection on its audio (VoiceAssistantCommandFlag
+    /// USE_WAKE_WORD), for devices with no spotter.
+    fn voice_request_start(&mut self, run: u64, phrase: &str, ha_wake: bool) {
         self.run = run;
         self.voice_stale = false;
         let Some(vc) = self.voice_client() else {
@@ -1439,7 +1449,9 @@ impl Server {
         audio.flt(3, 1.0, false); // volume_multiplier
         let mut w = Writer::new();
         w.boolean(1, true, false); // start
-        w.u32(3, 0, false); // flags: wake word handled on the device, VAD in HA
+        // Flags (VoiceAssistantCommandFlag): 0 = wake word handled on the device, VAD in HA;
+        // USE_WAKE_WORD (2) = HA runs its wake word stage on this run's audio.
+        w.u32(3, if ha_wake { 2 } else { 0 }, false);
         w.msg(4, &audio);
         w.str(5, phrase, false);
         self.audio_overflowed = false;

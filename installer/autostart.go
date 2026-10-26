@@ -39,6 +39,11 @@ var verityRe = regexp.MustCompile("(?i)verity|dm=")
 // on the filesystem mounted at / together with the firmware. cmdline = /proc/cmdline, mapper =
 // `ls /dev/mapper`, df = `df /etc /system/vendor/quasar`.
 func rootfsGuard(cmdline, mapper, df string) string {
+	return rootfsGuardLabeled(cmdline, mapper, df, "/system/vendor/quasar")
+}
+
+// rootfsGuardLabeled is rootfsGuard with the name of the second df path in its messages.
+func rootfsGuardLabeled(cmdline, mapper, df, second string) string {
 	for _, tok := range strings.Fields(cmdline) {
 		if verityRe.MatchString(tok) {
 			return "kernel command line has " + tok
@@ -63,7 +68,7 @@ func rootfsGuard(cmdline, mapper, df string) string {
 		return "cannot parse df output"
 	}
 	if f[0] != f[6] || f[5] != f[11] {
-		return fmt.Sprintf("/etc (%s on %s) and /system/vendor/quasar (%s on %s) are on different filesystems", f[0], f[5], f[6], f[11])
+		return fmt.Sprintf("/etc (%s on %s) and %s (%s on %s) are on different filesystems", f[0], f[5], second, f[6], f[11])
 	}
 	if f[5] != "/" {
 		return "/etc is on " + f[5] + ", not on the root filesystem"

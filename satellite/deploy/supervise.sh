@@ -24,6 +24,31 @@ D=${PULSAR_DIR:-/data/pulsar}
 LOG=${PULSAR_LOG:-/tmp/pulsar.log}
 Q=${PULSAR_Q:-/system/vendor/quasar/q}
 BIN=$D/pulsar
+# libasound reads $HOME/.asoundrc, where the installer keeps the pulsar PCM definitions on
+# devices without a firmware asound config for them (Irbis A).
+HOME=${HOME:-/root}
+export HOME
+# glibc sidecar (Irbis A: firmware glibc 2.23, the daemon binary needs >= 2.28): when the
+# installer put an armhf glibc runtime into $D/glibc, the daemon runs through ITS loader, which
+# maps the sidecar libc; the device's libasound (and its dlopened plugins) then resolve against
+# the newer libc, which serves the older objects. The loader is exec'd through a symlink named
+# "pulsar" so the kernel's comm stays "pulsar" and pidof/killall in the other scripts work.
+# The library path also carries the quasar alsa-lib directories: the Irbis A has no system-wide
+# libasound.so.2. override_libs comes first: it is the Yandex-patched build the stock audio
+# daemon runs with (launch.json gives audiod the ldLibraryPrefix), and its dmix is what creates
+# the ipc keys 0x400/0x401 the stale-lock cleanup below removes; libs/ is the fallback. Missing
+# directories are ignored by the loader.
+GLD=$D/glibc/pulsar
+if [ -x "$D/glibc/ld-linux-armhf.so.3" ]; then
+  ln -sf ld-linux-armhf.so.3 "$GLD" 2>/dev/null
+fi
+run_bin() {
+  if [ -x "$GLD" ]; then
+    "$GLD" --library-path "$D/glibc:/system/vendor/quasar/override_libs:/lib:/usr/lib:/system/vendor/quasar/libs" "$BIN" "$@"
+  else
+    "$BIN" "$@"
+  fi
+}
 MAXLOG=1000000
 LONG=${PULSAR_LONG:-300}
 CRASHES=5
@@ -43,10 +68,14 @@ rotate() {
 
 say() { echo "=== supervise: $* $(date)" >> "$LOG"; }
 
-give_back() { # Yandex stack again, like ctl.sh disable
+give_back() { # the stock stack again, like ctl.sh disable
   rm -f "$D/enabled"
   say "$1; disabled, starting the Yandex stack"
-  pidof quasar_launcher2 >/dev/null 2>&1 || "$Q" start >/dev/null 2>&1
+  if [ -x "$D/start_oem.sh" ]; then
+    "$D/start_oem.sh" >/dev/null 2>&1
+  elif ! pidof quasar_launcher2 >/dev/null 2>&1 && [ -x "$Q" ]; then
+    "$Q" start >/dev/null 2>&1
+  fi
   exit 1
 }
 
@@ -86,7 +115,7 @@ while [ -f "$D/enabled" ]; do
   clear_dmix
   echo "=== start $(date)" >> "$LOG"
   t0=$(uptime_s)
-  "$BIN" "$D/state.conf" >> "$LOG" 2>&1
+  run_bin "$D/state.conf" >> "$LOG" 2>&1
   rc=$?
   up=$(($(uptime_s) - t0))
   echo "=== exit $rc after ${up}s $(date)" >> "$LOG"

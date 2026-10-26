@@ -7,7 +7,7 @@ use pulsar_media::{Channel, PlayState};
 use pulsar_sendspin::SendspinEvent;
 
 use super::logic::{self, cxx_max, cxx_min};
-use super::{Controller, DUCK_GAIN, Pending, SOUNDS};
+use super::{Controller, DUCK_GAIN, Pending};
 
 impl Controller {
     pub(super) fn update_duck(&mut self) {
@@ -93,7 +93,7 @@ impl Controller {
             return;
         }
         // Music is not ducked under it; its Done has no Pending entry and is ignored.
-        let sound = format!("{SOUNDS}{}", self.model.volume_sound);
+        let sound = format!("{}{}", self.model.sound_dir, self.model.volume_sound);
         self.player.play(Channel::Announce, vec![sound]);
     }
 

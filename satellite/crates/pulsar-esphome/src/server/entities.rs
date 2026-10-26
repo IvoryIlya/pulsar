@@ -8,8 +8,8 @@ use tokio::time::Instant;
 use super::{ESPHOME_VERSION, PROJECT_NAME, Server, msg};
 use crate::proto::Writer;
 use crate::types::{
-    BinarySensorId, EventId, LightState, MediaState, NumberId, SelectId, SensorId, SwitchId,
-    TextId, TextSensorId, UpdateState,
+    BinarySensorId, EventId, LightState, MediaFormat, MediaState, NumberId, SelectId, SensorId,
+    SwitchId, TextId, TextSensorId, UpdateState,
 };
 
 /// Entity keys (fixed32), stable across restarts: HA keys its entities by them.
@@ -186,6 +186,30 @@ pub(super) fn parse_wireless(text: &str) -> Option<f32> {
     })
 }
 
+/// The media formats to advertise; the FLAC/48 kHz pair of the firmware GStreamer when the
+/// config lists none.
+fn media_formats(cfg: &[MediaFormat]) -> Vec<MediaFormat> {
+    if !cfg.is_empty() {
+        return cfg.to_vec();
+    }
+    vec![
+        MediaFormat {
+            format: "flac".into(),
+            rate: 48000,
+            channels: 2,
+            sample_bytes: 2,
+            announcement: false,
+        },
+        MediaFormat {
+            format: "flac".into(),
+            rate: 48000,
+            channels: 1,
+            sample_bytes: 2,
+            announcement: true,
+        },
+    ]
+}
+
 fn entity_head(w: &mut Writer, object_id: &str, key: u32, name: &str) {
     w.str(1, object_id, true);
     w.fixed32(2, key, true);
@@ -249,16 +273,21 @@ impl Server {
         let mut w = Writer::new();
         entity_head(&mut w, "media_player", key::MEDIA, "Media Player");
         w.boolean(8, true, false); // supports_pause (deprecated, for older clients)
-        for (channels, purpose) in [
-            (2, FORMAT_PURPOSE_DEFAULT),
-            (1, FORMAT_PURPOSE_ANNOUNCEMENT),
-        ] {
+        for f in media_formats(&self.cfg.media_formats) {
             let mut s = Writer::new();
-            s.str(1, "flac", false);
-            s.u32(2, 48000, false);
-            s.u32(3, channels, false);
-            s.u32(4, purpose, false);
-            s.u32(5, 2, false); // 16-bit
+            s.str(1, &f.format, false);
+            s.u32(2, f.rate, false);
+            s.u32(3, f.channels, false);
+            s.u32(
+                4,
+                if f.announcement {
+                    FORMAT_PURPOSE_ANNOUNCEMENT
+                } else {
+                    FORMAT_PURPOSE_DEFAULT
+                },
+                false,
+            );
+            s.u32(5, f.sample_bytes, false);
             w.msg(9, &s);
         }
         w.u32(11, MEDIA_FEATURES, false);
@@ -296,20 +325,24 @@ impl Server {
             "mdi:update",
             cfg,
         ));
-        out.push(switch(
-            "nearest_station_answers",
-            key::SW_NEAREST_ANSWERS,
-            "Nearest station answers",
-            "mdi:speaker-multiple",
-            cfg,
-        ));
-        out.push(switch(
-            "voice_indication",
-            key::SW_VOICE_INDICATION,
-            "Voice indication",
-            "mdi:led-on",
-            cfg,
-        ));
+        if self.cfg.ui.device_wake_word {
+            out.push(switch(
+                "nearest_station_answers",
+                key::SW_NEAREST_ANSWERS,
+                "Nearest station answers",
+                "mdi:speaker-multiple",
+                cfg,
+            ));
+        }
+        if self.cfg.ui.leds || self.cfg.has_clock {
+            out.push(switch(
+                "voice_indication",
+                key::SW_VOICE_INDICATION,
+                "Voice indication",
+                "mdi:led-on",
+                cfg,
+            ));
+        }
         let number = |oid, key, name, icon, (min, max, step): (f32, f32, f32), unit| {
             let mut w = Writer::new();
             entity_head(&mut w, oid, key, name);
@@ -322,14 +355,16 @@ impl Server {
             w.u32(12, NUMBER_MODE_SLIDER, false);
             (msg::LIST_NUMBER, w)
         };
-        out.push(number(
-            "led_speed",
-            key::NUMBER_LED_SPEED,
-            "LED speed",
-            "mdi:speedometer",
-            (LED_SPEED_MIN, LED_SPEED_MAX, 0.05),
-            "×",
-        ));
+        if self.cfg.ui.leds {
+            out.push(number(
+                "led_speed",
+                key::NUMBER_LED_SPEED,
+                "LED speed",
+                "mdi:speedometer",
+                (LED_SPEED_MIN, LED_SPEED_MAX, 0.05),
+                "×",
+            ));
+        }
         let select = |oid, key, name, icon, options: &[String], category: Option<u32>| {
             let mut w = Writer::new();
             entity_head(&mut w, oid, key, name);
@@ -342,22 +377,26 @@ impl Server {
             }
             (msg::LIST_SELECT, w)
         };
-        out.push(select(
-            "music_visualization",
-            key::SELECT_MUSIC_VIZ,
-            "Music visualization",
-            "mdi:equalizer",
-            &self.cfg.music_styles,
-            cfg,
-        ));
-        out.push(select(
-            "case_color",
-            key::SELECT_CASE_COLOR,
-            "Case color",
-            "mdi:palette",
-            &self.cfg.case_colors,
-            cfg,
-        ));
+        if self.cfg.ui.leds {
+            out.push(select(
+                "music_visualization",
+                key::SELECT_MUSIC_VIZ,
+                "Music visualization",
+                "mdi:equalizer",
+                &self.cfg.music_styles,
+                cfg,
+            ));
+        }
+        if self.cfg.ui.leds {
+            out.push(select(
+                "case_color",
+                key::SELECT_CASE_COLOR,
+                "Case color",
+                "mdi:palette",
+                &self.cfg.case_colors,
+                cfg,
+            ));
+        }
         if self.cfg.has_clock {
             out.push(select(
                 "clock_music",
@@ -373,16 +412,18 @@ impl Server {
         w.u32(7, ENTITY_CATEGORY_CONFIG, false);
         w.str(8, "firmware", false);
         out.push((msg::LIST_UPDATE, w));
-        let mut w = Writer::new();
-        entity_head(
-            &mut w,
-            "hardware_mic_mute",
-            key::BS_HW_MIC_MUTE,
-            "Hardware mic mute",
-        );
-        w.str(8, "mdi:microphone-off", false);
-        w.u32(9, ENTITY_CATEGORY_DIAGNOSTIC, false);
-        out.push((msg::LIST_BINARY_SENSOR, w));
+        if self.cfg.ui.hw_mute {
+            let mut w = Writer::new();
+            entity_head(
+                &mut w,
+                "hardware_mic_mute",
+                key::BS_HW_MIC_MUTE,
+                "Hardware mic mute",
+            );
+            w.str(8, "mdi:microphone-off", false);
+            w.u32(9, ENTITY_CATEGORY_DIAGNOSTIC, false);
+            out.push((msg::LIST_BINARY_SENSOR, w));
+        }
         if self.cfg.has_lux {
             let mut w = Writer::new();
             entity_head(&mut w, "illuminance", key::SENSOR_LUX, "Illuminance");
@@ -402,23 +443,27 @@ impl Server {
                 "%",
             ));
         }
-        let mut w = Writer::new();
-        entity_head(&mut w, "ring", key::LIGHT_RING, "Ring");
-        w.str(11, "None", true);
-        for e in &self.cfg.light_effects {
-            w.str(11, e, true);
+        if self.cfg.ui.leds {
+            let mut w = Writer::new();
+            entity_head(&mut w, "ring", key::LIGHT_RING, "Ring");
+            w.str(11, "None", true);
+            for e in &self.cfg.light_effects {
+                w.str(11, e, true);
+            }
+            w.packed_u32(12, &[COLOR_MODE_RGB]);
+            w.str(14, "mdi:led-strip-variant", false);
+            out.push((msg::LIST_LIGHT, w));
         }
-        w.packed_u32(12, &[COLOR_MODE_RGB]);
-        w.str(14, "mdi:led-strip-variant", false);
-        out.push((msg::LIST_LIGHT, w));
-        let mut w = Writer::new();
-        entity_head(&mut w, "button", key::EVENT_BUTTON, "Button");
-        w.str(5, "mdi:gesture-tap-button", false);
-        w.str(8, "button", false);
-        for t in ["action", "action_long", "volume_up", "volume_down"] {
-            w.str(9, t, true);
+        if self.cfg.ui.keys {
+            let mut w = Writer::new();
+            entity_head(&mut w, "button", key::EVENT_BUTTON, "Button");
+            w.str(5, "mdi:gesture-tap-button", false);
+            w.str(8, "button", false);
+            for t in ["action", "action_long", "volume_up", "volume_down"] {
+                w.str(9, t, true);
+            }
+            out.push((msg::LIST_EVENT, w));
         }
-        out.push((msg::LIST_EVENT, w));
         let mut w = Writer::new();
         entity_head(&mut w, "restart", key::BUTTON_RESTART, "Restart");
         w.u32(7, ENTITY_CATEGORY_CONFIG, false);
@@ -541,15 +586,17 @@ impl Server {
                 &[("face", SERVICE_ARG_STRING), ("seconds", SERVICE_ARG_INT)],
             ));
         }
-        out.push(action(
-            "led_show",
-            key::ACTION_LED_SHOW,
-            &[
-                ("effect", SERVICE_ARG_STRING),
-                ("color", SERVICE_ARG_STRING),
-                ("seconds", SERVICE_ARG_INT),
-            ],
-        ));
+        if self.cfg.ui.leds {
+            out.push(action(
+                "led_show",
+                key::ACTION_LED_SHOW,
+                &[
+                    ("effect", SERVICE_ARG_STRING),
+                    ("color", SERVICE_ARG_STRING),
+                    ("seconds", SERVICE_ARG_INT),
+                ],
+            ));
+        }
         out.push((msg::LIST_DONE, Writer::new()));
         for (t, w) in &out {
             self.send_msg(id, *t, w);
@@ -570,7 +617,8 @@ impl Server {
         for a in &self.cfg.active_wake_words {
             w.str(2, a, true);
         }
-        w.u32(3, 1, false); // max_active_wake_words
+        // Without device wake words HA runs the wake word detection itself.
+        w.u32(3, !self.cfg.wake_words.is_empty() as u32, false); // max_active_wake_words
         self.send_msg(id, msg::VA_CONFIG_RESP, &w);
     }
 
@@ -678,6 +726,7 @@ impl Server {
     pub(super) fn send_all_states(&mut self, id: u64) {
         let to = Some(id);
         let (has_clock, has_lux) = (self.cfg.has_clock, self.cfg.has_lux);
+        let ui = self.cfg.ui;
         let c = &self.cache;
         let (mic, clock, auto, nearest, voice, hw) = (
             c.sw_microphones,
@@ -694,17 +743,25 @@ impl Server {
             self.send_bool(msg::SWITCH_STATE, key::SW_CLOCK, clock, to);
         }
         self.send_bool(msg::SWITCH_STATE, key::SW_AUTO_UPDATE, auto, to);
-        self.send_bool(msg::SWITCH_STATE, key::SW_NEAREST_ANSWERS, nearest, to);
-        self.send_bool(msg::SWITCH_STATE, key::SW_VOICE_INDICATION, voice, to);
+        if ui.device_wake_word {
+            self.send_bool(msg::SWITCH_STATE, key::SW_NEAREST_ANSWERS, nearest, to);
+        }
+        if ui.leds || has_clock {
+            self.send_bool(msg::SWITCH_STATE, key::SW_VOICE_INDICATION, voice, to);
+        }
         self.send_update(to);
-        self.send_bool(msg::BINARY_SENSOR_STATE, key::BS_HW_MIC_MUTE, hw, to);
+        if ui.hw_mute {
+            self.send_bool(msg::BINARY_SENSOR_STATE, key::BS_HW_MIC_MUTE, hw, to);
+        }
         if has_lux {
             self.send_float(msg::SENSOR_STATE, key::SENSOR_LUX, lux, to);
         }
         if has_clock {
             self.send_float(msg::NUMBER_STATE, key::NUMBER_CLOCK_BRI, bri, to);
         }
-        self.send_light(to);
+        if ui.leds {
+            self.send_light(to);
+        }
         let rssi = self.cache.rssi;
         self.send_float(msg::SENSOR_STATE, key::SENSOR_RSSI, rssi, to);
         self.send_uptime(to);
@@ -727,19 +784,21 @@ impl Server {
                 to,
             );
         }
-        self.send_float(msg::NUMBER_STATE, key::NUMBER_LED_SPEED, speed, to);
-        self.send_cached_str(
-            msg::SELECT_STATE,
-            key::SELECT_MUSIC_VIZ,
-            |c| &c.music_viz,
-            to,
-        );
-        self.send_cached_str(
-            msg::SELECT_STATE,
-            key::SELECT_CASE_COLOR,
-            |c| &c.case_color,
-            to,
-        );
+        if ui.leds {
+            self.send_float(msg::NUMBER_STATE, key::NUMBER_LED_SPEED, speed, to);
+            self.send_cached_str(
+                msg::SELECT_STATE,
+                key::SELECT_MUSIC_VIZ,
+                |c| &c.music_viz,
+                to,
+            );
+            self.send_cached_str(
+                msg::SELECT_STATE,
+                key::SELECT_CASE_COLOR,
+                |c| &c.case_color,
+                to,
+            );
+        }
         if has_clock {
             self.send_cached_str(
                 msg::SELECT_STATE,
@@ -800,6 +859,7 @@ impl Server {
         let on = self.states_on();
         // Entities the device does not list get no states; their caches are kept all the same.
         let (has_clock, has_lux) = (self.cfg.has_clock, self.cfg.has_lux);
+        let ui = self.cfg.ui;
         let c = &mut self.cache;
         match p {
             Publish::Media(st, volume, muted) => {
@@ -824,14 +884,20 @@ impl Server {
                 };
                 *s = BoolState { has: true, v };
                 let s = *s;
-                if on && (has_clock || !matches!(id, SwitchId::Clock)) {
+                let listed = match id {
+                    SwitchId::Clock => has_clock,
+                    SwitchId::NearestAnswers => ui.device_wake_word,
+                    SwitchId::VoiceIndication => ui.leds || has_clock,
+                    _ => true,
+                };
+                if on && listed {
                     self.send_bool(msg::SWITCH_STATE, key, s, None);
                 }
             }
             Publish::BinarySensor(BinarySensorId::HwMicMute, v) => {
                 c.bs_hw_mute = BoolState { has: true, v };
                 let s = c.bs_hw_mute;
-                if on {
+                if on && ui.hw_mute {
                     self.send_bool(msg::BINARY_SENSOR_STATE, key::BS_HW_MIC_MUTE, s, None);
                 }
             }
@@ -850,7 +916,11 @@ impl Server {
                 };
                 *s = FloatState { has: true, v };
                 let s = *s;
-                if on && (has_clock || matches!(id, NumberId::LedSpeed)) {
+                let listed = match id {
+                    NumberId::ClockBrightness | NumberId::ClockScroll => has_clock,
+                    NumberId::LedSpeed => ui.leds,
+                };
+                if on && listed {
                     self.send_float(msg::NUMBER_STATE, key, s, None);
                 }
             }
@@ -868,7 +938,12 @@ impl Server {
                     SelectId::CaseColor => key::SELECT_CASE_COLOR,
                     SelectId::ClockMusic => key::SELECT_CLOCK_MUSIC,
                 };
-                if on && (has_clock || !matches!(id, SelectId::ClockFace | SelectId::ClockMusic)) {
+                let listed = match id {
+                    SelectId::ClockFace | SelectId::ClockMusic => has_clock,
+                    SelectId::MusicViz | SelectId::CaseColor => ui.leds,
+                    SelectId::ZigbeeMode => true,
+                };
+                if on && listed {
                     self.send_str(msg::SELECT_STATE, key, &v, true, None);
                 }
                 let c = &mut self.cache;
@@ -889,7 +964,7 @@ impl Server {
             }
             Publish::Light(st) => {
                 c.light = st;
-                if on {
+                if on && ui.leds {
                     self.send_light(None);
                 }
             }

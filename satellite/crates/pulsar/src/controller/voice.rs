@@ -11,9 +11,7 @@ use pulsar_media::{Channel, PlayState};
 use pulsar_sendspin::Transport;
 
 use super::logic::{self, COMMAND_AFTER_WAKE_MS, HaTimer, Phase, VoiceCommand};
-use super::{
-    Controller, LISTEN_TIMEOUT_MS, PROCESS_TIMEOUT_MS, Pending, SOUNDS, TIMER_RING_MAX_MS, Tk,
-};
+use super::{Controller, LISTEN_TIMEOUT_MS, PROCESS_TIMEOUT_MS, Pending, TIMER_RING_MAX_MS, Tk};
 
 impl Controller {
     fn arbitration_on(&self) -> bool {
@@ -58,6 +56,7 @@ impl Controller {
                     self.end_announce();
                 }
                 self.resume_ring();
+                self.maybe_arm_ha_wake();
             }
             Pending::MediaAnnounce { seq } => {
                 if seq == self.announce_seq {
@@ -65,6 +64,7 @@ impl Controller {
                     self.end_announce();
                 }
                 self.resume_ring();
+                self.maybe_arm_ha_wake();
             }
             Pending::Ring => {
                 if self.timer_ringing && !self.timers.is_set(Tk::RingTick) {
@@ -85,7 +85,10 @@ impl Controller {
                 "unsubscribed"
             }
         );
-        if !subscribed {
+        if subscribed {
+            self.wake_fails = 0;
+            self.maybe_arm_ha_wake();
+        } else {
             self.voice_link_lost();
         }
     }
@@ -100,7 +103,11 @@ impl Controller {
         self.run.reset();
         self.continue_conversation = false;
         self.tts_report_owed = false;
-        if matches!(self.phase, Phase::Listening | Phase::Processing) {
+        self.timers.cancel(Tk::WakeRearm);
+        if matches!(
+            self.phase,
+            Phase::Listening | Phase::Processing | Phase::WakeListen
+        ) {
             self.finish_interaction();
         }
     }
@@ -228,14 +235,14 @@ impl Controller {
         self.continue_conversation = false;
         self.update_duck();
         if earcon {
-            let sound = format!("{SOUNDS}{}", self.model.wake_sound);
+            let sound = format!("{}{}", self.model.sound_dir, self.model.wake_sound);
             self.player.play(Channel::Announce, vec![sound]);
         }
         // HA applies AnnounceFinished by forcing idle: an answer's report must not arrive over
         // the new dialog's listening state.
         self.send_tts_report(false);
         // A failed send comes back as VoiceStartFailed / VoiceAudioOverflow of this run.
-        self.voice_run = self.api.voice_request_start(phrase);
+        self.voice_run = self.api.voice_request_start(phrase, false);
         // HA drops audio queued before the start and queues what follows it on the same
         // connection.
         for chunk in preroll.chunks(512) {
@@ -251,6 +258,53 @@ impl Controller {
         self.mic.set_streaming(self.arbitrating);
         if self.phase == Phase::Listening {
             self.phase = Phase::Processing;
+        }
+    }
+
+    // ---------- Home Assistant wake word (models without a device engine) ----------
+
+    /// Keeps a wake word run open while the device would otherwise idle: HA runs its wake word
+    /// stage (openWakeWord) on the streamed audio. Guarded against every state in which the
+    /// microphone must stay closed or the run would be in the way.
+    pub(super) fn maybe_arm_ha_wake(&mut self) {
+        if !self.ha_wake
+            || self.phase != Phase::Idle
+            || self.announcing
+            || self.timer_ringing
+            || self.mic_muted()
+            || !self.api.voice_subscribed()
+        {
+            return;
+        }
+        self.timers.cancel(Tk::WakeRearm);
+        self.start_ha_wake();
+    }
+
+    fn start_ha_wake(&mut self) {
+        info!("listening for the Home Assistant wake word");
+        self.commands_blocked_until_ms = 0;
+        self.phase = Phase::WakeListen;
+        self.dialog += 1;
+        self.run.start();
+        self.stop_sent = false;
+        self.listen_started_ms = now_ms();
+        self.tts_url.clear();
+        self.tts_played = false;
+        self.continue_conversation = false;
+        self.update_duck(); // WakeListen does not duck; this only clears a stale duck
+        self.voice_run = self.api.voice_request_start("", true);
+        self.mic.set_streaming(true);
+        // No watchdog: the run is meant to stay open until HA hears the wake word; a lost link
+        // or HA's RUN_END ends it, and Tk::WakeRearm re-opens it (logic::ha_wake_rearm_ms).
+        self.update_ui();
+    }
+
+    /// Ends an open wake word run (an announcement, a timer ring or a mute needs the device to
+    /// itself). finish_interaction schedules the re-arm; maybe_arm_ha_wake's guards decide
+    /// whether it happens.
+    pub(super) fn disarm_ha_wake(&mut self) {
+        if self.phase == Phase::WakeListen {
+            self.finish_interaction();
         }
     }
 
@@ -279,6 +333,21 @@ impl Controller {
                 self.tts_url = get("url").to_owned();
                 self.tts_played = false;
                 self.continue_conversation = false;
+            }
+            VaEvent::WakeWordEnd => {
+                // HA's wake word stage heard something: speech recognition follows on the same
+                // run; the backoff of re-armed runs is over.
+                self.wake_fails = 0;
+            }
+            VaEvent::SttStart | VaEvent::SttVadStart => {
+                // The HA wake word run turns into a real dialog: from here the watchdog and the
+                // dialog semantics of LISTENING apply.
+                if self.phase == Phase::WakeListen {
+                    info!("Home Assistant wake word: listening");
+                    self.phase = Phase::Listening;
+                    self.listen_started_ms = now_ms();
+                    self.update_ui();
+                }
             }
             VaEvent::SttVadEnd | VaEvent::SttEnd => {
                 self.stop_streaming();
@@ -312,18 +381,29 @@ impl Controller {
                         "pipeline: another satellite answers this wake word (HA duplicate wake-up)"
                     );
                     self.stop_streaming();
+                } else if get("code") == "no_wake_word" {
+                    // HA's wake word stage ended without hearing its phrase: nothing is shown;
+                    // the run is re-opened (with a backoff while this keeps happening).
+                    info!("pipeline: no wake word heard, listening again");
+                    self.wake_fails += 1;
+                    self.finish_interaction();
                 } else {
                     warn!("pipeline error: {} {}", get("code"), get("message"));
                     self.stop_streaming();
                     self.error_shown = true;
                     self.show_ui(UiState::Error);
                     if get("code") != "stt-no-text-recognized" {
-                        let sound = format!("{SOUNDS}{}", self.model.error_sound);
+                        let sound = format!("{}{}", self.model.sound_dir, self.model.error_sound);
                         self.play_closing_earcon(sound);
                     }
                 }
             }
             VaEvent::RunEnd => {
+                // A wake word run that ends without ever reaching speech recognition counts
+                // towards the re-arm backoff (HA cancelled it, or its stage failed).
+                if self.phase == Phase::WakeListen {
+                    self.wake_fails += 1;
+                }
                 self.stop_streaming();
                 if !self.tts_played {
                     self.finish_interaction();
@@ -392,6 +472,10 @@ impl Controller {
         self.continue_conversation = false;
         self.update_duck();
         self.arm_watchdog();
+        if self.ha_wake {
+            self.timers
+                .set(Tk::WakeRearm, logic::ha_wake_rearm_ms(self.wake_fails));
+        }
         if self.error_shown {
             self.error_shown = false;
             self.timers.set(Tk::UiAfterError, 1200);
@@ -409,15 +493,29 @@ impl Controller {
     }
 
     pub(super) fn on_voice_start_failed(&mut self, run: u64) {
-        if run != self.voice_run || !matches!(self.phase, Phase::Listening | Phase::Processing) {
+        if run != self.voice_run
+            || !matches!(
+                self.phase,
+                Phase::Listening | Phase::Processing | Phase::WakeListen
+            )
+        {
             return;
         }
         self.run.awaiting_run_start = false; // no run follows
+        if self.phase == Phase::WakeListen {
+            // A refused wake word run counts towards the re-arm backoff, no error is shown.
+            self.wake_fails += 1;
+        }
         self.abort_dialog("Home Assistant refused to start it");
     }
 
     pub(super) fn on_voice_audio_overflow(&mut self, run: u64) {
-        if run != self.voice_run || !matches!(self.phase, Phase::Listening | Phase::Processing) {
+        if run != self.voice_run
+            || !matches!(
+                self.phase,
+                Phase::Listening | Phase::Processing | Phase::WakeListen
+            )
+        {
             return;
         }
         self.stop_sent = true; // by the server itself
@@ -459,7 +557,10 @@ impl Controller {
     /// the window after the wake word. An announcement playing over the dialog goes with it.
     fn cancel_dialog(&mut self) {
         self.interrupt_speech();
-        self.play_closing_earcon(format!("{SOUNDS}{}", self.model.cancel_sound));
+        self.play_closing_earcon(format!(
+            "{}{}",
+            self.model.sound_dir, self.model.cancel_sound
+        ));
         self.finish_interaction();
     }
 
@@ -494,6 +595,8 @@ impl Controller {
                 " (during a dialog)"
             }
         );
+        // The wake word run would stream the announcement into HA's wake word stage.
+        self.disarm_ha_wake();
         let mut urls = Vec::with_capacity(2);
         if !req.preannounce_media_id.is_empty() {
             urls.push(req.preannounce_media_id);
@@ -552,6 +655,7 @@ impl Controller {
             TimerEvent::Finished => {
                 self.ha_timers.remove(&t.id);
                 if !self.timer_ringing {
+                    self.disarm_ha_wake();
                     self.timer_ringing = true;
                     self.timer_ring_started_ms = now_ms();
                     self.update_duck();
@@ -605,7 +709,7 @@ impl Controller {
             self.ring_yielded = true;
             return;
         }
-        let sound = format!("{SOUNDS}{}", self.model.timer_sound);
+        let sound = format!("{}{}", self.model.sound_dir, self.model.timer_sound);
         self.play_announce(vec![sound], Pending::Ring);
     }
 
@@ -624,6 +728,7 @@ impl Controller {
         self.interrupt_speech(); // the ring, or the speech it yielded to
         self.update_duck();
         self.update_ui();
+        self.maybe_arm_ha_wake();
     }
 
     // ---------------- local commands ----------------

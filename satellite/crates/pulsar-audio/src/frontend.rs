@@ -238,7 +238,7 @@ impl Inner {
         tx: UnboundedSender<FrontendEvent>,
     ) -> std::io::Result<()> {
         let nch = model.capture_channels as usize;
-        let period = eng.chunk;
+        let period = eng.chunk();
         let pipe = Arc::new(Pipe {
             // 1 s of audio.
             fifo: Mutex::new(Fifo::new(nch, period, model.capture_rate as usize)),
@@ -521,7 +521,7 @@ fn processing(
     pipe: &Pipe,
     tx: &UnboundedSender<FrontendEvent>,
 ) {
-    let period = eng.chunk;
+    let period = eng.chunk();
     let nch = model.capture_channels as usize;
     let (mic_ch, spk_ch) = (model.mic_channels, model.spk_channels);
     let nspk = spk_ch.len();

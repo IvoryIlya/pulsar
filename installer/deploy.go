@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -45,6 +46,57 @@ func build() bool {
 	return true
 }
 
+// devHasSha256 reports (once per target) whether the device has sha256sum; the Irbis A busybox
+// may not, and station.sh-style verification then falls back to file sizes (weaker, but the
+// ssh transport already guarantees an intact copy better than the adb pty did).
+var devHasSha sync.Map
+
+func devHasSha256(s string) bool {
+	if v, ok := devHasSha.Load(s); ok {
+		return v.(bool)
+	}
+	_, err := sh(s, "command -v sha256sum >/dev/null 2>&1")
+	has := err == nil
+	devHasSha.Store(s, has)
+	return has
+}
+
+// devSum is the device's checksum of a remote path, comparable with localSumFor: "sha256:<hex>"
+// or "size:<bytes>"; "" when the file does not exist (or the read failed).
+func devSum(s, remote string) string {
+	if devHasSha256(s) {
+		out, err := sh(s, "[ -f "+remote+" ] && sha256sum "+remote)
+		if err != nil || firstField(out) == "" {
+			return ""
+		}
+		return "sha256:" + firstField(out)
+	}
+	out, err := sh(s, "[ -f "+remote+" ] && wc -c < "+remote)
+	if err != nil {
+		return ""
+	}
+	n := strings.TrimSpace(out)
+	if n == "" || strings.ContainsAny(n, "\n ") {
+		return ""
+	}
+	return "size:" + n
+}
+
+// localSumFor is the local counterpart of devSum (same method the device supports).
+func localSumFor(s, local string) string {
+	if devHasSha256(s) {
+		if h := sha256File(local); h != "" {
+			return "sha256:" + h
+		}
+		return ""
+	}
+	fi, err := os.Stat(local)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("size:%d", fi.Size())
+}
+
 func sha256File(p string) string {
 	f, err := os.Open(p)
 	if err != nil {
@@ -68,12 +120,12 @@ func installOne(st station) (ok bool, note string, lost bool) {
 		return false, "", false
 	}
 	ts := time.Now().Format("20060102150405")
-	changed, supChanged, ok := deployFiles(s, bin, st.arch, st.zigbee)
+	changed, supChanged, ok := deployFiles(s, bin, st.arch, st.zigbee, st.code, st.modelOverride)
 	if !ok {
 		return false, "", false
 	}
 	fmt.Printf("== %s: autostart\n", s)
-	note, lost, ok = bootAutostart(s, ts)
+	note, lost, ok = bootAutostart(s, ts, st.code)
 	if !ok {
 		return false, "", false
 	}
@@ -101,7 +153,7 @@ func installOne(st station) (ok bool, note string, lost bool) {
 
 // deployFiles copies the daemon, scripts, the radio's firmware images (zigbee) and dropbear (--ssh).
 // changed: the binary was replaced; supChanged: supervise.sh differs from the installed one.
-func deployFiles(s, bin, arch string, zigbee bool) (changed, supChanged, ok bool) {
+func deployFiles(s, bin, arch string, zigbee bool, code string, modelOverride bool) (changed, supChanged, ok bool) {
 	changed, supChanged = true, true
 	sshOut := filepath.Join(root, "ssh", "out", arch)
 	deploy := filepath.Join(root, "satellite", "deploy")
@@ -109,26 +161,37 @@ func deployFiles(s, bin, arch string, zigbee bool) (changed, supChanged, ok bool
 	if shTo(os.Stdout, s, "mkdir -p "+dataDir) != nil {
 		return
 	}
-	want := sha256File(bin)
-	have, _ := sh(s, "[ -f "+dataDir+"/pulsar ] && sha256sum "+dataDir+"/pulsar")
-	if want == firstField(have) {
+	if modelOverride {
+		// The devicetree names nothing known: the daemon (detect_model) and boot.sh read the
+		// codename from this file instead.
+		if have, _ := sh(s, "head -n1 "+dataDir+"/model 2>/dev/null"); strings.TrimSpace(have) != code {
+			if shTo(os.Stdout, s, "printf '%s\\n' "+code+" > "+dataDir+"/model") != nil {
+				return
+			}
+			fmt.Printf("wrote %s/model = %s (generic devicetree)\n", dataDir, code)
+		}
+	}
+	want := localSumFor(s, bin)
+	if want == "" {
+		fmt.Fprintf(os.Stderr, "%s: cannot checksum %s locally\n", s, bin)
+		return
+	}
+	if want == devSum(s, dataDir+"/pulsar") {
 		fmt.Println("binary identical to the installed one, not copied (.prev kept)")
 		changed = false
 	} else {
 		if push(s, bin, dataDir+"/pulsar.new") != nil {
 			return
 		}
-		got, _ := sh(s, "sha256sum "+dataDir+"/pulsar.new")
-		if want != firstField(got) {
+		if got := devSum(s, dataDir+"/pulsar.new"); want != got {
 			_ = shTo(os.Stdout, s, "rm -f "+dataDir+"/pulsar.new")
-			fmt.Fprintf(os.Stderr, "%s: push corrupted (sha256 mismatch), nothing changed\n", s)
+			fmt.Fprintf(os.Stderr, "%s: push corrupted (checksum mismatch), nothing changed\n", s)
 			return
 		}
 	}
 	// Scripts: a running shell reads its script incrementally, so replace them atomically (new inode).
 	// A running supervisor keeps executing the old inode: when supervise.sh changed it is reloaded.
-	supHave, _ := sh(s, "[ -f "+dataDir+"/supervise.sh ] && sha256sum "+dataDir+"/supervise.sh")
-	if firstField(supHave) == sha256File(filepath.Join(deploy, "supervise.sh")) {
+	if devSum(s, dataDir+"/supervise.sh") == localSumFor(s, filepath.Join(deploy, "supervise.sh")) {
 		supChanged = false
 	}
 	for _, f := range []string{"boot.sh", "supervise.sh", "ctl.sh"} {
@@ -151,6 +214,10 @@ func deployFiles(s, bin, arch string, zigbee bool) (changed, supChanged, ok bool
 	}
 
 	if zigbee && (!deployRadioImage(s, "zigbee-coordinator.ybl") || !deployRadioImage(s, "zigbee-router.ybl")) {
+		return
+	}
+
+	if code == "irbisA" && (!deployIrbisAudio(s) || !deployGlibc(s) || !deployIrbisOem(s)) {
 		return
 	}
 
@@ -184,18 +251,16 @@ func deployRadioImage(s, name string) bool {
 		fmt.Println("radio/out/" + name + " missing (radio/build.sh), not copied")
 		return true
 	}
-	want := sha256File(img)
-	have, _ := sh(s, "[ -f "+dataDir+"/"+name+" ] && sha256sum "+dataDir+"/"+name)
-	if firstField(have) == want {
+	want := localSumFor(s, img)
+	if want != "" && want == devSum(s, dataDir+"/"+name) {
 		return true
 	}
 	if push(s, img, dataDir+"/"+name+".new") != nil {
 		return false
 	}
-	got, _ := sh(s, "sha256sum "+dataDir+"/"+name+".new")
-	if firstField(got) != want {
+	if got := devSum(s, dataDir+"/"+name+".new"); got != want {
 		_ = shTo(os.Stdout, s, "rm -f "+dataDir+"/"+name+".new")
-		fmt.Fprintf(os.Stderr, "%s: push corrupted (sha256 mismatch), %s not replaced\n", s, name)
+		fmt.Fprintf(os.Stderr, "%s: push corrupted (checksum mismatch), %s not replaced\n", s, name)
 		return false
 	}
 	return shTo(os.Stdout, s, "cd "+dataDir+" && mv "+name+".new "+name+" && sync") == nil
@@ -204,16 +269,15 @@ func deployRadioImage(s, name string) bool {
 // bootAutostart makes initPath current, then removes the hooks older installers added to
 // rootkeeper.sh. note: autostart could not be written (said in the final summary); lost: nothing
 // starts pulsar at boot; !ok: station error.
-func bootAutostart(s, ts string) (note string, lost, ok bool) {
+func bootAutostart(s, ts, code string) (note string, lost, ok bool) {
 	// Dropbear is installed by --ssh, in this run or an earlier one: never drop its autostart.
 	_, err := sh(s, "[ -x /data/dropbear/start.sh ]")
 	want := initScript(err == nil)
-	sum := sha256.Sum256([]byte(want))
-	wantSum := hex.EncodeToString(sum[:])
-	if have, _ := sh(s, "[ -f "+initPath+" ] && sha256sum "+initPath); firstField(have) == wantSum {
+	wantSum := sumAsDevice(s, want)
+	if have := devSum(s, initPath); have != "" && have == wantSum {
 		fmt.Println(initPath + " up to date")
 	} else {
-		reason, ok := writeInitScript(s, want, wantSum)
+		reason, ok := writeInitScript(s, want, code)
 		if !ok {
 			return "", false, false
 		}
@@ -223,12 +287,26 @@ func bootAutostart(s, ts string) (note string, lost, ok bool) {
 			return note, lost, true
 		}
 	}
+	if isSSH(s) {
+		// rootkeeper.sh belongs to the Yandex root method; an ssh station has none.
+		return "", false, true
+	}
 	return "", false, migrateRootkeeper(s, ts)
+}
+
+// sumAsDevice is want's checksum in the format devSum reports for this device.
+func sumAsDevice(s, want string) string {
+	if devHasSha256(s) {
+		sum := sha256.Sum256([]byte(want))
+		return "sha256:" + hex.EncodeToString(sum[:])
+	}
+	return fmt.Sprintf("size:%d", len(want))
 }
 
 // writeInitScript writes want to initPath. reason != "": refused, nothing written (protected or
 // unreadable rootfs, remount failed); !ok: station error, reported on stderr.
-func writeInitScript(s, want, wantSum string) (reason string, ok bool) {
+func writeInitScript(s, want, code string) (reason string, ok bool) {
+	wantSum := sumAsDevice(s, want)
 	mounts, err := sh(s, "cat /proc/mounts")
 	if err != nil {
 		return "cannot read /proc/mounts", true
@@ -243,14 +321,20 @@ func writeInitScript(s, want, wantSum string) (reason string, ok bool) {
 	}
 	// The pipe keeps ls from formatting for the pty (columns, colour).
 	mapper, _ := sh(s, "ls /dev/mapper 2>/dev/null | cat")
-	df, err := sh(s, "df /etc /system/vendor/quasar")
-	if err != nil {
-		return "df /etc /system/vendor/quasar failed", true
+	// The second path is what must share the root filesystem with /etc: the quasar directory on
+	// the Yandex Stations, / itself elsewhere (Irbis A: no /system/vendor).
+	second := "/system/vendor/quasar"
+	if code == "irbisA" {
+		second = "/"
 	}
-	if r := rootfsGuard(cmdline, mapper, df); r != "" {
+	df, err := sh(s, "df /etc "+second)
+	if err != nil {
+		return "df /etc " + second + " failed", true
+	}
+	if r := rootfsGuardLabeled(cmdline, mapper, df, second); r != "" {
 		return r, true
 	}
-	fmt.Println("rootfs: no dm-verity or device-mapper, /etc and /system/vendor/quasar on the root filesystem")
+	fmt.Println("rootfs: no dm-verity or device-mapper, /etc and " + second + " on the root filesystem")
 
 	tmp, err := os.MkdirTemp("", "pulsar-install")
 	if err != nil {
@@ -289,7 +373,7 @@ func writeInitScript(s, want, wantSum string) (reason string, ok bool) {
 			ok = false
 		}()
 	}
-	out, err := shRaw(s, writeInitCmd(src, wantSum, !rw))
+	out, err := shRaw(s, writeInitCmd(src, want, !rw, devHasSha256(s)))
 	if strings.Contains(out, "remount-rw-failed") {
 		return "mount -o remount,rw / failed", true
 	}
@@ -297,7 +381,7 @@ func writeInitScript(s, want, wantSum string) (reason string, ok bool) {
 		fmt.Fprintf(os.Stderr, "%s: writing %s failed:\n%s\n", s, initPath, out)
 		return "", false
 	}
-	if got, _ := sh(s, "sha256sum "+initPath); firstField(got) != wantSum {
+	if got := devSum(s, initPath); got != wantSum {
 		fmt.Fprintf(os.Stderr, "%s: %s on the device differs from the checked file\n", s, initPath)
 		return "", false
 	}
@@ -310,15 +394,21 @@ func writeInitScript(s, want, wantSum string) (reason string, ok bool) {
 
 // writeInitCmd is one device command, so the read-write window never spans two adb calls. The
 // ignored HUP lets it finish if adb drops; the dot name keeps rcS's S??* glob from running a
-// partial file. The subshell keeps exit from skipping shRaw's status echo.
-func writeInitCmd(src, sum string, remount bool) string {
+// partial file. The subshell keeps exit from skipping shRaw's status echo. Devices without
+// sha256sum verify the copy by its size.
+func writeInitCmd(src, content string, remount, hasSha bool) string {
+	sum := sha256.Sum256([]byte(content))
+	verify := fmt.Sprintf(`{ set -- $(sha256sum $T); [ "$1" = %s ]; }`, hex.EncodeToString(sum[:]))
+	if !hasSha {
+		verify = fmt.Sprintf(`[ "$(wc -c < $T)" = %d ]`, len(content))
+	}
 	l := []string{"( trap '' HUP INT"}
 	if remount {
 		l = append(l, "mount -o remount,rw / || { echo remount-rw-failed; exit 1; }")
 	}
 	l = append(l,
 		"T=/etc/init.d/.S99zpulsar.tmp",
-		"cp "+src+" $T && chmod 755 $T && set -- $(sha256sum $T) && [ \"$1\" = "+sum+" ] && mv $T "+initPath+" && sync",
+		"cp "+src+" $T && chmod 755 $T && "+verify+" && mv $T "+initPath+" && sync",
 		"rc=$?",
 		"rm -f $T")
 	if remount {
@@ -326,6 +416,136 @@ func writeInitCmd(src, sum string, remount bool) string {
 	}
 	l = append(l, "exit $rc )")
 	return strings.Join(l, "\n")
+}
+
+// deployIrbisOem copies the default stop_oem.sh / start_oem.sh (the stock-stack hooks of
+// boot.sh / ctl.sh / supervise.sh) — only when the device has none, so on-device edits are
+// never clobbered.
+func deployIrbisOem(s string) bool {
+	for _, name := range []string{"stop_oem.sh", "start_oem.sh"} {
+		if _, err := sh(s, "[ -e "+dataDir+"/"+name+" ]"); err == nil {
+			continue // keep the device's own version
+		}
+		local := filepath.Join(root, "satellite", "deploy", "irbis", name)
+		if _, err := os.Stat(local); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", s, err)
+			return false
+		}
+		fmt.Printf("== %s: %s (default, edit on the device as needed)\n", s, name)
+		if push(s, local, dataDir+"/"+name+".new") != nil {
+			return false
+		}
+		if shTo(os.Stdout, s, "chmod 755 "+dataDir+"/"+name+".new && mv "+dataDir+"/"+name+".new "+dataDir+"/"+name) != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// deployGlibc copies the armhf glibc sidecar (satellite/deploy/glibc/out/, made by fetch.py,
+// git-ignored and optional): the Irbis A's firmware glibc (2.23) is older than the daemon
+// binary's floor, so supervise.sh runs the daemon through the sidecar's loader. No payload
+// directory: skipped silently (a firmware with a new enough libc runs the binary directly).
+func deployGlibc(s string) bool {
+	dir := filepath.Join(root, "satellite", "deploy", "glibc", "out")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return true
+	}
+	fmt.Printf("== %s: glibc sidecar (%s/glibc)\n", s, dataDir)
+	if shTo(os.Stdout, s, "mkdir -p "+dataDir+"/glibc") != nil {
+		return false
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		local := filepath.Join(dir, e.Name())
+		remote := dataDir + "/glibc/" + e.Name()
+		want := localSumFor(s, local)
+		if want != "" && want == devSum(s, remote) {
+			continue
+		}
+		if push(s, local, remote+".new") != nil {
+			return false
+		}
+		if got := devSum(s, remote+".new"); got != want {
+			_ = shTo(os.Stdout, s, "rm -f "+remote+".new")
+			fmt.Fprintf(os.Stderr, "%s: push corrupted (checksum mismatch), glibc/%s not replaced\n", s, e.Name())
+			return false
+		}
+		if shTo(os.Stdout, s, "chmod 755 "+remote+".new && mv "+remote+".new "+remote) != nil {
+			return false
+		}
+	}
+	// The loader runs the daemon through this symlink (comm stays "pulsar" for pidof).
+	if shTo(os.Stdout, s, "cd "+dataDir+"/glibc && ln -sf ld-linux-armhf.so.3 pulsar && sync") != nil {
+		return false
+	}
+	return true
+}
+
+// deployIrbisAudio writes the daemon's ALSA configuration on an Irbis A: the marked pulsar
+// block into /root/.asoundrc (a previous block is replaced, everything else is kept, the
+// original file is backed up once as .asoundrc.pulsar-bak), and the earcon WAVs into
+// /data/pulsar/sounds (the Model's sound_dir).
+func deployIrbisAudio(s string) bool {
+	block, err := os.ReadFile(filepath.Join(root, "satellite", "deploy", "irbis", "asoundrc"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", s, err)
+		return false
+	}
+	tmp, err := os.MkdirTemp("", "pulsar-install")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return false
+	}
+	defer os.RemoveAll(tmp)
+	f := filepath.Join(tmp, "asoundrc-block")
+	if err := os.WriteFile(f, block, 0o644); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return false
+	}
+	fmt.Printf("== %s: ALSA config (/root/.asoundrc)\n", s)
+	if push(s, f, "/tmp/pulsar-asoundrc.new") != nil {
+		return false
+	}
+	script := `F=/root/.asoundrc
+[ -e "$F" ] || : > "$F"
+[ -e "$F.pulsar-bak" ] || cp "$F" "$F.pulsar-bak"
+{ sed '/^# --- pulsar begin ---$/,/^# --- pulsar end ---$/d' "$F"; cat /tmp/pulsar-asoundrc.new; } > "$F.tmp" &&
+  mv "$F.tmp" "$F" && rm -f /tmp/pulsar-asoundrc.new && sync`
+	if shTo(os.Stdout, s, script) != nil {
+		return false
+	}
+	fmt.Printf("== %s: earcons (%s/sounds)\n", s, dataDir)
+	if shTo(os.Stdout, s, "mkdir -p "+dataDir+"/sounds") != nil {
+		return false
+	}
+	for _, name := range []string{"spotter_start.wav", "spotter_cancel.wav", "timer.wav", "error.wav", "volume_sound.wav"} {
+		local := filepath.Join(root, "satellite", "deploy", "irbis", "sounds", name)
+		remote := dataDir + "/sounds/" + name
+		want := localSumFor(s, local)
+		if want == "" {
+			fmt.Fprintf(os.Stderr, "%s: %s missing from the payload\n", s, name)
+			return false
+		}
+		if want == devSum(s, remote) {
+			continue
+		}
+		if push(s, local, remote+".new") != nil {
+			return false
+		}
+		if got := devSum(s, remote+".new"); got != want {
+			_ = shTo(os.Stdout, s, "rm -f "+remote+".new")
+			fmt.Fprintf(os.Stderr, "%s: push corrupted (checksum mismatch), %s not replaced\n", s, name)
+			return false
+		}
+		if shTo(os.Stdout, s, "mv "+remote+".new "+remote) != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // autostartFallback tells, after initPath could not be written, what still starts pulsar at boot.

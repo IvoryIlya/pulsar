@@ -1,6 +1,6 @@
-//! Every libc call of the crate: framebuffer and evdev ioctls, non-blocking evdev reads. The
-//! ioctl numbers mean these requests only on their own device types, so they are methods of
-//! `Framebuffer` and `Evdev`, which can only be created by opening such a node.
+//! Every libc call of the crate: framebuffer, evdev and i2c ioctls, non-blocking evdev reads.
+//! The ioctl numbers mean these requests only on their own device types, so they are methods of
+//! `Framebuffer`, `Evdev` and `I2c`, which can only be created by opening such a node.
 
 use std::fs::File;
 use std::io;
@@ -170,6 +170,38 @@ impl Evdev {
     /// EVIOCGSW: switch states.
     pub fn switch_state(&self) -> io::Result<SwBits> {
         self.eviocg(0x1b)
+    }
+}
+
+const I2C_SLAVE_FORCE: libc::Ioctl = 0x0706;
+
+/// An open i2c-dev client with its slave address claimed (I2C_SLAVE_FORCE, as the chip's
+/// bring-up tool does: it works even where a kernel driver has the address reserved).
+pub struct I2c {
+    file: File,
+}
+
+impl I2c {
+    /// Opens the `/dev/i2c-N` bus and claims the 7-bit address `addr`.
+    pub fn open(dev: &str, addr: u16) -> io::Result<I2c> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dev)?;
+        let fd = file.as_raw_fd();
+        // SAFETY: an ioctl on the just-opened i2c-dev descriptor; it only binds the slave
+        // address used by the following read/write calls and takes no pointer argument.
+        let rc = unsafe { libc::ioctl(fd, I2C_SLAVE_FORCE, libc::c_ulong::from(addr)) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(I2c { file })
+    }
+
+    /// One two-byte transaction (register, value) to the claimed address.
+    pub fn write2(&self, reg: u8, val: u8) -> io::Result<()> {
+        use std::io::Write as _;
+        (&self.file).write_all(&[reg, val])
     }
 }
 

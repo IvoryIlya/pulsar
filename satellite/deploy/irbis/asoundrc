@@ -1,0 +1,56 @@
+# pulsar on the Irbis A (Amlogic A113X), written by pulsar-install into /root/.asoundrc between
+# the markers below (alsa-lib reads it after /etc/asound.conf). The daemon runs as root; the
+# deploy scripts export HOME=/root so libasound finds this file.
+#
+#   pulsar_mic  - capture for the daemon: the OEM DSP delivers the microphone array on the
+#                 TDM-C interface (hw:0,1) strictly as 8-channel interleaved S16_LE at 48 kHz
+#                 (period 512 / buffer 2048; other layouts fail or clip). The physical
+#                 microphones sit on channels 0 and 1 (channel 1 measured cleanest for speech),
+#                 channel 2 is the internal acoustic loopback (the AEC reference). This plug
+#                 extracts channel 1 with the empirically found 8x digital boost (+18 dB) and
+#                 resamples to the 16 kHz mono the voice pipeline uses.
+#   speakers    - playback for the daemon (media player, Sendspin sink, WAV fallback player and
+#                 the "Master Playback Volume" the Mixer drives): plug/softvol over the
+#                 firmware's dmixer_auto dmix on TDM-B (hw:0,0), which mixes concurrent streams
+#                 without locking the hardware. softvol min_dB -60 matches the stock volume
+#                 curve the daemon maps onto (Model::volume_map).
+# The stock stack's own default/softvol ('Master' control, created by opening default) is
+# deliberately NOT overridden: /root/.asoundrc is also read while the stock stack runs again
+# after ctl.sh disable, and breaking its volume path is not pulsar's business. The daemon only
+# ever opens pulsar_mic and speakers by name.
+# --- pulsar begin ---
+pcm.pulsar_mic {
+    type rate
+    slave {
+        pcm {
+            type route
+            slave {
+                pcm "hw:0,1"
+                channels 8
+            }
+            # output channel 0 <- input channel 1, 8x (~ +18 dB)
+            ttable.0.1 8.0
+        }
+        rate 16000
+    }
+}
+
+pcm.!speakers {
+    type plug
+    slave {
+        pcm {
+            type softvol
+            slave {
+                pcm "dmixer_auto"
+            }
+            control {
+                name "Master Playback Volume"
+                card 0
+            }
+            min_dB -60.0
+            max_dB 0.0
+        }
+    }
+}
+
+# --- pulsar end ---

@@ -11,6 +11,8 @@
 /satellite/target/
 /satellite/third_party/src/
 /ssh/out/
+# The glibc sidecar payload for old-libc ports (satellite/deploy/glibc/fetch.py regenerates it).
+/satellite/deploy/glibc/out/
 /installer/dist/
 # adb downloaded by pulsar-install when it runs from a checkout.
 /platform-tools/
@@ -19,3 +21,5 @@
 
 # Test recordings / synthesized speech.
 *.wav
+# ...but the Irbis A earcons are part of the deploy payload (generated, original tones).
+!/satellite/deploy/irbis/sounds/*.wav

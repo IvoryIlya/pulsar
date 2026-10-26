@@ -29,6 +29,19 @@ done
 put radio/out/zigbee-router.ybl 644
 put radio/out/zigbee-coordinator.ybl 644
 for f in boot.sh supervise.sh ctl.sh; do put satellite/deploy/$f 755; done
+put satellite/deploy/glibc/fetch.py 755
+# The glibc sidecar payload is optional (fetch.py regenerates it; it is not in git).
+if [ -d "$ROOT/satellite/deploy/glibc/out" ]; then
+  for f in "$ROOT"/satellite/deploy/glibc/out/*; do
+    put "satellite/deploy/glibc/out/$(basename "$f")" 755
+  done
+fi
+put satellite/deploy/irbis/asoundrc 644
+put satellite/deploy/irbis/stop_oem.sh 755
+put satellite/deploy/irbis/start_oem.sh 755
+for f in spotter_start.wav spotter_cancel.wav timer.wav error.wav volume_sound.wav; do
+  put satellite/deploy/irbis/sounds/$f 644
+done
 put ssh/start.sh 755
 put README.md 644
 put LICENSE 644
